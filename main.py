@@ -62,16 +62,23 @@ def calc_ema(prices, period):
     return ema
 
 def get_candles(symbol, interval, limit=100):
-    r = get_public("/v5/market/kline", {
-        "category": "linear",
-        "symbol":   symbol,
-        "interval": interval,
-        "limit":    limit
-    })
-    candles = r["result"]["list"]
-    candles.reverse()
-    closes = [float(c[4]) for c in candles]
-    return closes
+    for attempt in range(3):  # retry up to 3 times
+        try:
+            r = requests.get(f"{BASE_URL}/v5/market/kline", params={
+                "category": "linear",
+                "symbol":   symbol,
+                "interval": interval,
+                "limit":    limit
+            }, timeout=10)
+            data = r.json()
+            candles = data["result"]["list"]
+            candles.reverse()
+            closes = [float(c[4]) for c in candles]
+            return closes
+        except Exception as e:
+            print(f"Candle fetch attempt {attempt+1} failed for {symbol}: {e}")
+            time.sleep(2)
+    return []
 
 def check_signal(symbol):
     try:
