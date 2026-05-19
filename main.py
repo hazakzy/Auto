@@ -15,8 +15,8 @@ API_SECRET       = os.environ.get("BYBIT_API_SECRET")
 BASE_URL_PUBLIC  = "https://api.bybit.com"
 BASE_URL_PRIVATE = "https://api-demo.bybit.com"
 
-TRADE_USDT = 10
-LEVERAGE   = 2
+TRADE_USDT = 100
+LEVERAGE   = 10
 SYMBOLS    = ["BTCUSDT"]
 INTERVAL   = "15"
 EMA_FAST   = 12
