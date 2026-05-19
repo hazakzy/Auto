@@ -90,6 +90,32 @@ def get_qty_precision(symbol):
             time.sleep(2)
     return 3
 
+# ─── Sync state from Bybit on startup ────────────────────────────────────────
+def sync_state_from_bybit():
+    print("Syncing state from Bybit...")
+    for symbol in SYMBOLS:
+        try:
+            params  = {"category": "linear", "symbol": symbol}
+            headers = sign(params)
+            r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
+                headers=headers, params=params, timeout=10)
+            positions = r.json().get("result", {}).get("list", [])
+            for pos in positions:
+                size = float(pos.get("size", 0))
+                side = pos.get("side", "")
+                if size > 0:
+                    if side == "Buy":
+                        last_signal[symbol] = "buy"
+                    elif side == "Sell":
+                        last_signal[symbol] = "sell"
+                    print(f"Synced {symbol} — open {side} position size={size} → last_signal={last_signal[symbol]}")
+                else:
+                    print(f"Synced {symbol} — no open position")
+        except Exception as e:
+            print(f"Sync error for {symbol}: {e}")
+    bot_status["last_signal"] = last_signal.copy()
+    print(f"State after sync: {last_signal}")
+
 # ─── Signal logic — 2 candle confirmation ─────────────────────────────────────
 def check_signal(symbol):
     closes = get_candles(symbol)
@@ -97,12 +123,11 @@ def check_signal(symbol):
         print(f"{symbol} not enough candles: {len(closes)}")
         return None
 
-    # Three points in time
     fast_now   = calc_ema(closes,      EMA_FAST)
     slow_now   = calc_ema(closes,      EMA_SLOW)
-    fast_prev  = calc_ema(closes[:-1], EMA_FAST)  # confirmation candle
+    fast_prev  = calc_ema(closes[:-1], EMA_FAST)
     slow_prev  = calc_ema(closes[:-1], EMA_SLOW)
-    fast_prev2 = calc_ema(closes[:-2], EMA_FAST)  # signal candle
+    fast_prev2 = calc_ema(closes[:-2], EMA_FAST)
     slow_prev2 = calc_ema(closes[:-2], EMA_SLOW)
 
     print(f"{symbol} | "
@@ -110,12 +135,10 @@ def check_signal(symbol):
           f"C1 EMA12={round(fast_prev,2)} EMA21={round(slow_prev,2)} | "
           f"NOW EMA12={round(fast_now,2)} EMA21={round(slow_now,2)}")
 
-    # Buy: crossover on C2, confirmed on C1, still holds now
     buy_signal  = (fast_prev2 < slow_prev2 and
                    fast_prev  > slow_prev  and
                    fast_now   > slow_now)
 
-    # Sell: crossunder on C2, confirmed on C1, still holds now
     sell_signal = (fast_prev2 > slow_prev2 and
                    fast_prev  < slow_prev  and
                    fast_now   < slow_now)
@@ -187,6 +210,10 @@ def run_bot():
     print("=" * 55)
     print("GKC Bot started — EMA 12/21 — 15M — 2 candle confirm")
     print("=" * 55)
+
+    # Sync open positions from Bybit before starting
+    sync_state_from_bybit()
+
     while True:
         try:
             print(f"\n--- Scan {time.strftime('%Y-%m-%d %H:%M:%S')} UTC ---")
@@ -205,7 +232,6 @@ def run_bot():
                 else:
                     print(f"{symbol} | no new signal — holding")
 
-            # Sleep to next 15m candle close
             now   = time.time()
             sleep = (15 * 60) - (now % (15 * 60)) + 5
             print(f"Sleeping {round(sleep/60, 1)} mins until next candle close")
@@ -228,7 +254,7 @@ def index():
         "interval":    f"{INTERVAL}m",
         "leverage":    LEVERAGE,
         "trade_usdt":  TRADE_USDT,
-        "mode":        "flip on signal — 2 candle confirmation — no SL no TP"
+        "mode":        "flip on signal — 2 candle confirm — no SL no TP"
     })
 
 @app.route("/test")
@@ -249,6 +275,33 @@ def test():
 def force_order():
     result = place_order("BTCUSDT", "buy")
     return jsonify({"result": result})
+
+@app.route("/status")
+def status():
+    # Live check of open positions on Bybit
+    try:
+        positions = {}
+        for symbol in SYMBOLS:
+            params  = {"category": "linear", "symbol": symbol}
+            headers = sign(params)
+            r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
+                headers=headers, params=params, timeout=10)
+            for pos in r.json().get("result", {}).get("list", []):
+                size = float(pos.get("size", 0))
+                if size > 0:
+                    positions[symbol] = {
+                        "side":        pos["side"],
+                        "size":        size,
+                        "entry_price": pos.get("avgPrice", "N/A"),
+                        "unrealised_pnl": pos.get("unrealisedPnl", "N/A")
+                    }
+        return jsonify({
+            "open_positions": positions,
+            "last_signal":    last_signal,
+            "last_scan":      bot_status["last_scan"]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 # ─── Start ────────────────────────────────────────────────────────────────────
 bot_thread = threading.Thread(target=run_bot, daemon=True)
