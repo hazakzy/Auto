@@ -208,6 +208,14 @@ def run_bot():
             time.sleep(30)  # wait 30s and retry
 
 # ─── Status page ──────────────────────────────────────────────────────────────
+@app.route("/test", methods=["GET"])
+def test_order():
+    try:
+        result = place_order("BTCUSDT", "buy")
+        return jsonify({"status": "test order sent", "result": str(result)})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+        
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({
