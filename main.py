@@ -53,6 +53,7 @@ def get_candles(symbol):
             "interval": INTERVAL,
             "limit":    150
         }, timeout=10)
+        print(f"Candle raw: {r.status_code} {r.text[:200]}")
         candles = r.json()["result"]["list"]
         candles.reverse()
         return [float(c[4]) for c in candles]
@@ -64,6 +65,7 @@ def get_price(symbol):
     r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/tickers", params={
         "category": "linear", "symbol": symbol
     }, timeout=10)
+    print(f"Price raw: {r.status_code} {r.text[:200]}")
     return float(r.json()["result"]["list"][0]["lastPrice"])
 
 def get_qty_precision(symbol):
@@ -74,17 +76,15 @@ def get_qty_precision(symbol):
     return len(step.rstrip("0").split(".")[-1]) if "." in step else 0
 
 def set_leverage(symbol):
-    headers = sign({"category": "linear", "symbol": symbol,
-                    "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)})
+    body    = {"category": "linear", "symbol": symbol,
+               "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)}
+    headers = sign(body)
     r = requests.post(f"{BASE_URL_PRIVATE}/v5/position/set-leverage",
-        headers=headers,
-        json={"category": "linear", "symbol": symbol,
-              "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)},
-        timeout=10)
+        headers=headers, json=body, timeout=10)
     print(f"Leverage: {r.json()}")
 
 def close_position(symbol):
-    params = {"category": "linear", "symbol": symbol}
+    params  = {"category": "linear", "symbol": symbol}
     headers = sign(params)
     r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
         headers=headers, params=params, timeout=10)
@@ -92,12 +92,12 @@ def close_position(symbol):
         size = float(pos.get("size", 0))
         if size > 0:
             close_side = "Sell" if pos["side"] == "Buy" else "Buy"
-            body = {"category": "linear", "symbol": symbol,
-                    "side": close_side, "orderType": "Market",
-                    "qty": str(size), "reduceOnly": True}
-            headers2 = sign(body)
+            body    = {"category": "linear", "symbol": symbol,
+                       "side": close_side, "orderType": "Market",
+                       "qty": str(size), "reduceOnly": True}
+            headers = sign(body)
             r2 = requests.post(f"{BASE_URL_PRIVATE}/v5/order/create",
-                headers=headers2, json=body, timeout=10)
+                headers=headers, json=body, timeout=10)
             print(f"Closed: {r2.json()}")
     time.sleep(1)
 
@@ -109,15 +109,10 @@ def place_order(symbol, signal):
         precision = get_qty_precision(symbol)
         qty       = round((TRADE_USDT * LEVERAGE) / price, precision)
         side      = "Buy" if signal == "buy" else "Sell"
-        body      = {
-            "category":    "linear",
-            "symbol":      symbol,
-            "side":        side,
-            "orderType":   "Market",
-            "qty":         str(qty),
-            "timeInForce": "GTC"
-        }
-        headers = sign(body)
+        body      = {"category": "linear", "symbol": symbol,
+                     "side": side, "orderType": "Market",
+                     "qty": str(qty), "timeInForce": "GTC"}
+        headers   = sign(body)
         r = requests.post(f"{BASE_URL_PRIVATE}/v5/order/create",
             headers=headers, json=body, timeout=10)
         result = r.json()
@@ -131,6 +126,7 @@ def place_order(symbol, signal):
 def check_signal(symbol):
     closes = get_candles(symbol)
     if len(closes) < EMA_SLOW + 5:
+        print(f"{symbol} not enough candles: {len(closes)}")
         return None
     fast_now  = calc_ema(closes,      EMA_FAST)
     slow_now  = calc_ema(closes,      EMA_SLOW)
@@ -147,7 +143,7 @@ def run_bot():
     print("Bot started")
     while True:
         try:
-            print(f"\nScan at {time.strftime('%H:%M:%S')} UTC")
+            print(f"\nScan {time.strftime('%H:%M:%S')} UTC")
             bot_status["last_scan"] = time.strftime('%H:%M:%S UTC')
             for symbol in SYMBOLS:
                 signal = check_signal(symbol)
@@ -171,32 +167,25 @@ def run_bot():
 @app.route("/")
 def index():
     return jsonify({
-        "status":     "running",
-        "bot":        bot_status,
+        "status":      "running",
+        "bot":         bot_status,
         "last_signal": last_signal,
-        "symbols":    SYMBOLS,
-        "interval":   INTERVAL,
-        "leverage":   LEVERAGE,
-        "trade_usdt": TRADE_USDT
+        "symbols":     SYMBOLS,
+        "interval":    INTERVAL,
+        "leverage":    LEVERAGE,
+        "trade_usdt":  TRADE_USDT
     })
 
 @app.route("/test")
 def test():
     try:
-        # Test 1 — public price
-        price = get_price("BTCUSDT")
-
-        # Test 2 — demo account balance
-        params  = {"accountType": "UNIFIED"}
-        headers = sign(params)
-        r = requests.get(f"{BASE_URL_PRIVATE}/v5/account/wallet-balance",
-            headers=headers, params=params, timeout=10)
-        balance = r.json()
-
+        r = requests.get("https://api.bybit.com/v5/market/tickers", params={
+            "category": "linear", "symbol": "BTCUSDT"
+        }, timeout=10)
         return jsonify({
-            "btc_price": price,
-            "api_keys_set": bool(API_KEY and API_SECRET),
-            "demo_balance": balance
+            "status_code": r.status_code,
+            "raw_text":    r.text[:500],
+            "api_keys_set": bool(API_KEY and API_SECRET)
         })
     except Exception as e:
         traceback.print_exc()
