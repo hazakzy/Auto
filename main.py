@@ -4,19 +4,17 @@ import hmac
 import hashlib
 import time
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify
 import threading
 import traceback
 
 app = Flask(__name__)
 
-# ─── Config ───────────────────────────────────────────────────────────────────
 API_KEY          = os.environ.get("BYBIT_API_KEY")
 API_SECRET       = os.environ.get("BYBIT_API_SECRET")
 BASE_URL_PUBLIC  = "https://api.bybit.com"
 BASE_URL_PRIVATE = "https://api-demo.bybit.com"
 
-# ─── Risk settings ────────────────────────────────────────────────────────────
 TRADE_USDT = 10
 LEVERAGE   = 2
 SYMBOLS    = ["BTCUSDT"]
@@ -24,11 +22,9 @@ INTERVAL   = "15"
 EMA_FAST   = 12
 EMA_SLOW   = 21
 
-# ─── State ────────────────────────────────────────────────────────────────────
 last_signal = {}
-bot_status  = {"running": False, "last_scan": None, "error": None}
+bot_status  = {"last_scan": "never", "last_signal": {}, "error": None}
 
-# ─── Signature ────────────────────────────────────────────────────────────────
 def sign(params):
     timestamp   = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -42,194 +38,175 @@ def sign(params):
         "Content-Type":       "application/json"
     }
 
-def post(endpoint, params):
-    headers = sign(params)
-    r = requests.post(f"{BASE_URL_PRIVATE}{endpoint}", headers=headers, json=params, timeout=10)
-    return r.json()
-
-def get_signed(endpoint, params={}):
-    headers = sign(params)
-    r = requests.get(f"{BASE_URL_PRIVATE}{endpoint}", headers=headers, params=params, timeout=10)
-    return r.json()
-
-def get_public(endpoint, params={}):
-    for attempt in range(3):
-        try:
-            r = requests.get(f"{BASE_URL_PUBLIC}{endpoint}", params=params, timeout=10)
-            return r.json()
-        except Exception as e:
-            print(f"Public API attempt {attempt+1} failed: {e}")
-            time.sleep(2)
-    return {}
-
-# ─── EMA ──────────────────────────────────────────────────────────────────────
 def calc_ema(prices, period):
     k   = 2 / (period + 1)
     ema = prices[0]
-    for price in prices[1:]:
-        ema = price * k + ema * (1 - k)
+    for p in prices[1:]:
+        ema = p * k + ema * (1 - k)
     return ema
 
 def get_candles(symbol):
-    for attempt in range(3):
-        try:
-            data = get_public("/v5/market/kline", {
-                "category": "linear",
-                "symbol":   symbol,
-                "interval": INTERVAL,
-                "limit":    150
-            })
-            candles = data["result"]["list"]
-            candles.reverse()
-            closes = [float(c[4]) for c in candles]
-            return closes
-        except Exception as e:
-            print(f"Candle fetch attempt {attempt+1} failed for {symbol}: {e}")
-            time.sleep(2)
-    return []
+    try:
+        r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/kline", params={
+            "category": "linear",
+            "symbol":   symbol,
+            "interval": INTERVAL,
+            "limit":    150
+        }, timeout=10)
+        candles = r.json()["result"]["list"]
+        candles.reverse()
+        return [float(c[4]) for c in candles]
+    except Exception as e:
+        print(f"Candle error: {e}")
+        return []
 
-def check_signal(symbol):
-    closes = get_candles(symbol)
-    if len(closes) < EMA_SLOW + 5:
-        print(f"{symbol} — not enough candles ({len(closes)})")
-        return None
-
-    ema_fast_now  = calc_ema(closes,      EMA_FAST)
-    ema_slow_now  = calc_ema(closes,      EMA_SLOW)
-    ema_fast_prev = calc_ema(closes[:-1], EMA_FAST)
-    ema_slow_prev = calc_ema(closes[:-1], EMA_SLOW)
-
-    print(f"{symbol} — EMA12: {round(ema_fast_now,2)} | EMA21: {round(ema_slow_now,2)}")
-
-    if ema_fast_prev < ema_slow_prev and ema_fast_now > ema_slow_now:
-        return "buy"
-    elif ema_fast_prev > ema_slow_prev and ema_fast_now < ema_slow_now:
-        return "sell"
-    return None
-
-# ─── Order helpers ────────────────────────────────────────────────────────────
 def get_price(symbol):
-    data = get_public("/v5/market/tickers", {"category": "linear", "symbol": symbol})
-    return float(data["result"]["list"][0]["lastPrice"])
+    r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/tickers", params={
+        "category": "linear", "symbol": symbol
+    }, timeout=10)
+    return float(r.json()["result"]["list"][0]["lastPrice"])
 
-def get_precision(symbol):
-    data = get_public("/v5/market/instruments-info", {"category": "linear", "symbol": symbol})
-    qty_step = data["result"]["list"][0]["lotSizeFilter"]["qtyStep"]
-    decimals = len(qty_step.rstrip("0").split(".")[-1]) if "." in qty_step else 0
-    return decimals
+def get_qty_precision(symbol):
+    r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/instruments-info", params={
+        "category": "linear", "symbol": symbol
+    }, timeout=10)
+    step = r.json()["result"]["list"][0]["lotSizeFilter"]["qtyStep"]
+    return len(step.rstrip("0").split(".")[-1]) if "." in step else 0
 
 def set_leverage(symbol):
-    params = {
-        "category":     "linear",
-        "symbol":       symbol,
-        "buyLeverage":  str(LEVERAGE),
-        "sellLeverage": str(LEVERAGE)
-    }
-    result = post("/v5/position/set-leverage", params)
-    print(f"Leverage: {result}")
+    headers = sign({"category": "linear", "symbol": symbol,
+                    "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)})
+    r = requests.post(f"{BASE_URL_PRIVATE}/v5/position/set-leverage",
+        headers=headers,
+        json={"category": "linear", "symbol": symbol,
+              "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)},
+        timeout=10)
+    print(f"Leverage: {r.json()}")
 
-def close_existing(symbol):
-    r = get_signed("/v5/position/list", {"category": "linear", "symbol": symbol})
-    positions = r.get("result", {}).get("list", [])
-    for pos in positions:
+def close_position(symbol):
+    params = {"category": "linear", "symbol": symbol}
+    headers = sign(params)
+    r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
+        headers=headers, params=params, timeout=10)
+    for pos in r.json().get("result", {}).get("list", []):
         size = float(pos.get("size", 0))
         if size > 0:
             close_side = "Sell" if pos["side"] == "Buy" else "Buy"
-            result = post("/v5/order/create", {
-                "category":   "linear",
-                "symbol":     symbol,
-                "side":       close_side,
-                "orderType":  "Market",
-                "qty":        str(size),
-                "reduceOnly": True
-            })
-            print(f"Closed position {symbol}: {result}")
-    time.sleep(0.5)
+            body = {"category": "linear", "symbol": symbol,
+                    "side": close_side, "orderType": "Market",
+                    "qty": str(size), "reduceOnly": True}
+            headers2 = sign(body)
+            r2 = requests.post(f"{BASE_URL_PRIVATE}/v5/order/create",
+                headers=headers2, json=body, timeout=10)
+            print(f"Closed: {r2.json()}")
+    time.sleep(1)
 
 def place_order(symbol, signal):
     try:
         set_leverage(symbol)
-        close_existing(symbol)
-
+        close_position(symbol)
         price     = get_price(symbol)
-        precision = get_precision(symbol)
+        precision = get_qty_precision(symbol)
         qty       = round((TRADE_USDT * LEVERAGE) / price, precision)
         side      = "Buy" if signal == "buy" else "Sell"
-
-        result = post("/v5/order/create", {
+        body      = {
             "category":    "linear",
             "symbol":      symbol,
             "side":        side,
             "orderType":   "Market",
             "qty":         str(qty),
             "timeInForce": "GTC"
-        })
-        print(f"Order placed {symbol} {side} qty={qty} @ {price}")
-        print(f"Response: {result}")
-
+        }
+        headers = sign(body)
+        r = requests.post(f"{BASE_URL_PRIVATE}/v5/order/create",
+            headers=headers, json=body, timeout=10)
+        result = r.json()
+        print(f"Order {symbol} {side} qty={qty} @ {price}: {result}")
+        return result
     except Exception as e:
-        print(f"Order error {symbol}: {e}")
+        print(f"Order error: {e}")
         traceback.print_exc()
+        return {"error": str(e)}
 
-# ─── Bot loop ─────────────────────────────────────────────────────────────────
+def check_signal(symbol):
+    closes = get_candles(symbol)
+    if len(closes) < EMA_SLOW + 5:
+        return None
+    fast_now  = calc_ema(closes,      EMA_FAST)
+    slow_now  = calc_ema(closes,      EMA_SLOW)
+    fast_prev = calc_ema(closes[:-1], EMA_FAST)
+    slow_prev = calc_ema(closes[:-1], EMA_SLOW)
+    print(f"{symbol} EMA12={round(fast_now,2)} EMA21={round(slow_now,2)}")
+    if fast_prev < slow_prev and fast_now > slow_now:
+        return "buy"
+    if fast_prev > slow_prev and fast_now < slow_now:
+        return "sell"
+    return None
+
 def run_bot():
-    bot_status["running"] = True
-    print("=" * 50)
-    print("Bot started — GKC EMA 12/21 — 15M BTCUSDT")
-    print("=" * 50)
-
+    print("Bot started")
     while True:
         try:
-            print(f"\n--- Scan at {time.strftime('%H:%M:%S')} UTC ---")
-            bot_status["last_scan"] = time.strftime('%Y-%m-%d %H:%M:%S UTC')
-
+            print(f"\nScan at {time.strftime('%H:%M:%S')} UTC")
+            bot_status["last_scan"] = time.strftime('%H:%M:%S UTC')
             for symbol in SYMBOLS:
                 signal = check_signal(symbol)
                 prev   = last_signal.get(symbol)
-                print(f"{symbol} — signal: {signal} | prev: {prev}")
-
+                print(f"{symbol} signal={signal} prev={prev}")
                 if signal and signal != prev:
-                    print(f">>> {symbol} {signal.upper()} — placing order")
+                    print(f">>> {symbol} {signal.upper()} firing!")
                     place_order(symbol, signal)
                     last_signal[symbol] = signal
-                else:
-                    print(f"{symbol} — holding, no new signal")
-
-            # Sleep to next 15m candle
+                    bot_status["last_signal"] = last_signal.copy()
             now   = time.time()
             sleep = (15 * 60) - (now % (15 * 60)) + 5
-            print(f"Next scan in {round(sleep/60, 1)} mins")
+            print(f"Sleeping {round(sleep/60,1)} mins")
             time.sleep(sleep)
-
         except Exception as e:
             bot_status["error"] = str(e)
-            print(f"Bot loop error: {e}")
+            print(f"Loop error: {e}")
             traceback.print_exc()
-            time.sleep(30)  # wait 30s and retry
+            time.sleep(30)
 
-# ─── Status page ──────────────────────────────────────────────────────────────
-@app.route("/test", methods=["GET"])
-def test_order():
-    try:
-        result = place_order("BTCUSDT", "buy")
-        return jsonify({"status": "test order sent", "result": str(result)})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
-        
-@app.route("/", methods=["GET"])
-def health():
+@app.route("/")
+def index():
     return jsonify({
-        "status":      "running",
-        "bot":         bot_status,
-        "symbols":     SYMBOLS,
+        "status":     "running",
+        "bot":        bot_status,
         "last_signal": last_signal,
-        "interval":    f"{INTERVAL}m",
-        "leverage":    LEVERAGE,
-        "trade_usdt":  TRADE_USDT,
-        "mode":        "flip on signal — no SL no TP"
+        "symbols":    SYMBOLS,
+        "interval":   INTERVAL,
+        "leverage":   LEVERAGE,
+        "trade_usdt": TRADE_USDT
     })
 
-# ─── Start ────────────────────────────────────────────────────────────────────
+@app.route("/test")
+def test():
+    try:
+        # Test 1 — public price
+        price = get_price("BTCUSDT")
+
+        # Test 2 — demo account balance
+        params  = {"accountType": "UNIFIED"}
+        headers = sign(params)
+        r = requests.get(f"{BASE_URL_PRIVATE}/v5/account/wallet-balance",
+            headers=headers, params=params, timeout=10)
+        balance = r.json()
+
+        return jsonify({
+            "btc_price": price,
+            "api_keys_set": bool(API_KEY and API_SECRET),
+            "demo_balance": balance
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)})
+
+@app.route("/forceorder")
+def force_order():
+    result = place_order("BTCUSDT", "buy")
+    return jsonify({"result": result})
+
 bot_thread = threading.Thread(target=run_bot, daemon=True)
 bot_thread.start()
 
