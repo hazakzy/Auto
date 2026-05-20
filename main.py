@@ -16,18 +16,17 @@ API_SECRET       = os.environ.get("BYBIT_API_SECRET")
 BASE_URL_PUBLIC  = "https://api.bybit.com"
 BASE_URL_PRIVATE = "https://api-demo.bybit.com"
 
-TRADE_USDT      = 100
-LEVERAGE        = 2
-SYMBOLS         = ["BTCUSDT"]
-INTERVAL        = "15"
-EMA_FAST        = 12
-EMA_SLOW        = 21
-MAX_DAILY_LOSS  = 50    # stop trading if daily loss exceeds $50
-MIN_BODY_PCT    = 0.001  # minimum candle body = 0.1% of price
+TRADE_USDT     = 100
+LEVERAGE       = 2
+SYMBOLS        = ["BTCUSDT"]
+INTERVAL       = "15"
+EMA_FAST       = 12
+EMA_SLOW       = 21
+MAX_DAILY_LOSS = 50
 
-last_signal  = {}
-bot_status   = {"last_scan": "never", "error": None}
-daily_pnl    = {"date": None, "pnl": 0.0, "trades": 0, "stopped": False}
+last_signal = {}
+bot_status  = {"last_scan": "never", "error": None}
+daily_pnl   = {"date": None, "pnl": 0.0, "trades": 0, "stopped": False}
 
 # ─── Signature ────────────────────────────────────────────────────────────────
 def sign(params):
@@ -63,8 +62,7 @@ def get_candles(symbol):
             }, timeout=10)
             candles = r.json()["result"]["list"]
             candles.reverse()
-            # Return full candle data: [open, high, low, close]
-            return candles
+            return [float(c[4]) for c in candles]
         except Exception as e:
             print(f"Candle fetch attempt {attempt+1} failed: {e}")
             time.sleep(2)
@@ -95,21 +93,19 @@ def get_qty_precision(symbol):
             time.sleep(2)
     return 3
 
-# ─── Precise candle close detection ──────────────────────────────────────────
+# ─── Precise candle close ─────────────────────────────────────────────────────
 def wait_for_candle_close():
     interval_seconds = int(INTERVAL) * 60
-    now              = time.time()
-    seconds_into     = now % interval_seconds
-    seconds_left     = interval_seconds - seconds_into
-    # Only sleep if we're not already within 2 seconds of close
+    now          = time.time()
+    seconds_left = interval_seconds - (now % interval_seconds)
     if seconds_left > 2:
-        sleep_time = seconds_left + 2  # +2 sec buffer
+        sleep_time = seconds_left + 2
         print(f"Waiting {round(sleep_time/60, 2)} mins for candle close...")
         time.sleep(sleep_time)
     else:
         time.sleep(3)
 
-# ─── Daily PnL reset ──────────────────────────────────────────────────────────
+# ─── Daily PnL ────────────────────────────────────────────────────────────────
 def check_daily_reset():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if daily_pnl["date"] != today:
@@ -136,43 +132,49 @@ def update_daily_pnl(symbol):
                 if pnl != 0:
                     daily_pnl["pnl"]    += pnl
                     daily_pnl["trades"] += 1
-        print(f"Daily PnL updated: ${round(daily_pnl['pnl'], 2)} over {daily_pnl['trades']} trades")
+        print(f"Daily PnL: ${round(daily_pnl['pnl'],2)} | Trades: {daily_pnl['trades']}")
     except Exception as e:
         print(f"PnL update error: {e}")
 
-# ─── Sync state from Bybit ────────────────────────────────────────────────────
+# ─── Sync from Bybit — robust version ────────────────────────────────────────
 def sync_state_from_bybit():
-    print("Syncing state from Bybit...")
+    print("Syncing open positions from Bybit...")
     for symbol in SYMBOLS:
         try:
             params  = {"category": "linear", "symbol": symbol}
             headers = sign(params)
             r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
                 headers=headers, params=params, timeout=10)
-            positions = r.json().get("result", {}).get("list", [])
+            result = r.json()
+            print(f"Sync raw response: {result}")
+            positions = result.get("result", {}).get("list", [])
             found = False
             for pos in positions:
                 size = float(pos.get("size", 0))
                 side = pos.get("side", "")
                 if size > 0:
-                    last_signal[symbol] = "buy" if side == "Buy" else "sell"
-                    print(f"Synced {symbol} → {side} size={size} → last_signal={last_signal[symbol]}")
+                    sig = "buy" if side == "Buy" else "sell"
+                    last_signal[symbol] = sig
+                    print(f"✅ Synced {symbol} → {side} size={size} "
+                          f"entry={pos.get('avgPrice')} "
+                          f"pnl={pos.get('unrealisedPnl')} "
+                          f"→ last_signal={sig}")
                     found = True
             if not found:
-                print(f"Synced {symbol} → no open position")
+                # No position found — clear signal so bot can enter fresh
+                last_signal.pop(symbol, None)
+                print(f"⚪ {symbol} → no open position found")
         except Exception as e:
-            print(f"Sync error for {symbol}: {e}")
+            print(f"Sync error {symbol}: {e}")
+            traceback.print_exc()
     print(f"State after sync: {last_signal}")
 
-# ─── Signal logic ─────────────────────────────────────────────────────────────
+# ─── Signal — no body filter, 2 candle confirm ────────────────────────────────
 def check_signal(symbol):
-    candles = get_candles(symbol)
-    if len(candles) < EMA_SLOW + 5:
-        print(f"{symbol} not enough candles: {len(candles)}")
+    closes = get_candles(symbol)
+    if len(closes) < EMA_SLOW + 5:
+        print(f"{symbol} not enough candles: {len(closes)}")
         return None
-
-    closes = [float(c[4]) for c in candles]
-    opens  = [float(c[1]) for c in candles]
 
     fast_now   = calc_ema(closes,      EMA_FAST)
     slow_now   = calc_ema(closes,      EMA_SLOW)
@@ -181,27 +183,15 @@ def check_signal(symbol):
     fast_prev2 = calc_ema(closes[:-2], EMA_FAST)
     slow_prev2 = calc_ema(closes[:-2], EMA_SLOW)
 
-    # Candle body filter — confirmation candle must have meaningful body
-    confirm_close = closes[-2]
-    confirm_open  = opens[-2]
-    candle_body   = abs(confirm_close - confirm_open) / confirm_open
-    body_ok       = candle_body >= MIN_BODY_PCT
-
     print(f"{symbol} | "
           f"C2 12={round(fast_prev2,2)} 21={round(slow_prev2,2)} | "
-          f"C1 12={round(fast_prev,2)} 21={round(slow_prev,2)} body={round(candle_body*100,3)}% | "
+          f"C1 12={round(fast_prev,2)} 21={round(slow_prev,2)} | "
           f"NOW 12={round(fast_now,2)} 21={round(slow_now,2)}")
 
-    if not body_ok:
-        print(f"{symbol} — candle body too small ({round(candle_body*100,3)}%) — skipping")
-        return None
-
-    # Buy: crossover on C2, confirmed on C1, still holds now
     buy_signal  = (fast_prev2 < slow_prev2 and
                    fast_prev  > slow_prev  and
                    fast_now   > slow_now)
 
-    # Sell: crossunder on C2, confirmed on C1, still holds now
     sell_signal = (fast_prev2 > slow_prev2 and
                    fast_prev  < slow_prev  and
                    fast_now   < slow_now)
@@ -212,7 +202,7 @@ def check_signal(symbol):
         return "sell"
     return None
 
-# ─── Order helpers ────────────────────────────────────────────────────────────
+# ─── Orders ───────────────────────────────────────────────────────────────────
 def set_leverage(symbol):
     body    = {"category": "linear", "symbol": symbol,
                "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)}
@@ -266,7 +256,7 @@ def place_order(symbol, signal):
         r = requests.post(f"{BASE_URL_PRIVATE}/v5/order/create",
             headers=headers, json=body, timeout=10)
         result = r.json()
-        print(f"Order {symbol} {side} qty={qty} @ {price} | {result}")
+        print(f"✅ Order {symbol} {side} qty={qty} @ {price} | {result}")
         return result
 
     except Exception as e:
@@ -284,35 +274,34 @@ def close_all_positions():
 def run_bot():
     print("=" * 55)
     print("GKC Bot — EMA 12/21 — 15M — 2 candle confirm")
-    print(f"Max daily loss: ${MAX_DAILY_LOSS} | Min body: {MIN_BODY_PCT*100}%")
+    print(f"Max daily loss: ${MAX_DAILY_LOSS} | No body filter")
     print("=" * 55)
 
     sync_state_from_bybit()
 
     while True:
         try:
-            # Wait for precise candle close
             wait_for_candle_close()
-
-            # Reset daily PnL if new day
             check_daily_reset()
 
             print(f"\n--- Scan {time.strftime('%Y-%m-%d %H:%M:%S')} UTC ---")
             bot_status["last_scan"] = time.strftime('%Y-%m-%d %H:%M:%S UTC')
             print(f"Daily PnL: ${round(daily_pnl['pnl'],2)} | "
-                  f"Trades today: {daily_pnl['trades']} | "
+                  f"Trades: {daily_pnl['trades']} | "
                   f"Stopped: {daily_pnl['stopped']}")
 
-            # Daily loss limit check
             if daily_pnl["stopped"]:
-                print("Daily loss limit reached — skipping all signals today")
+                print("Daily loss limit reached — skipping today")
                 continue
 
             if daily_pnl["pnl"] <= -MAX_DAILY_LOSS:
                 daily_pnl["stopped"] = True
-                print(f"Daily loss limit ${MAX_DAILY_LOSS} hit — closing all and stopping for today")
+                print(f"Daily loss ${MAX_DAILY_LOSS} hit — closing all")
                 close_all_positions()
                 continue
+
+            # Re-sync every scan to always know real position state
+            sync_state_from_bybit()
 
             for symbol in SYMBOLS:
                 signal = check_signal(symbol)
@@ -381,7 +370,7 @@ def sync():
     try:
         sync_state_from_bybit()
         return jsonify({
-            "message":     "Synced successfully",
+            "message":     "Synced",
             "last_signal": last_signal
         })
     except Exception as e:
@@ -405,7 +394,6 @@ def test():
             "category": "linear", "symbol": "BTCUSDT"
         }, timeout=10)
         return jsonify({
-            "status_code":  r.status_code,
             "btc_price":    r.json()["result"]["list"][0]["lastPrice"],
             "api_keys_set": bool(API_KEY and API_SECRET)
         })
