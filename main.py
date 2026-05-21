@@ -761,6 +761,23 @@ def test():
 
         return jsonify({"error": str(e)})
 
+@app.route("/debug")
+def debug():
+    try:
+        results = {}
+        for symbol in SYMBOLS:
+            params  = {"category": "linear", "symbol": symbol}
+            headers = sign(params)
+            r = requests.get(
+                f"{BASE_URL_PRIVATE}/v5/position/list",
+                headers=headers,
+                params=params,
+                timeout=10
+            )
+            results[symbol] = r.json()
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({"error": str(e)})
 # ─── START ────────────────────────────────────────────────────────────────────
 
 bot_thread = threading.Thread(
