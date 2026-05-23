@@ -15,7 +15,7 @@ app = Flask(__name__)
 API_KEY          = os.environ.get("BYBIT_API_KEY")
 API_SECRET       = os.environ.get("BYBIT_API_SECRET")
 BASE_URL_PUBLIC  = "https://api.bybit.com"
-BASE_URL_PRIVATE = "https://api-demo.bybit.com"
+BASE_URL_PRIVATE = "https://api.bybit.com"
 
 TRADE_USDT     = 20
 LEVERAGE       = 10
