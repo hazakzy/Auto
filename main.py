@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 app = Flask(__name__)
 
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
 API_KEY          = os.environ.get("BYBIT_API_KEY")
 API_SECRET       = os.environ.get("BYBIT_API_SECRET")
 BASE_URL_PUBLIC  = "https://api.bybit.com"
@@ -19,13 +20,18 @@ BASE_URL_PRIVATE = "https://api.bybit.com"
 
 TRADE_USDT     = 20
 LEVERAGE       = 10
-SYMBOLS        = ["BTCUSDT"]
+SYMBOLS         = ["BTCUSDT", "HYPEUSDT"]
 INTERVAL       = "60"
 EMA_FAST       = 12
 EMA_SLOW       = 21
 MAX_DAILY_LOSS = 50
+RETRACE_PCT    = 0.70   # close if price gives back 70% of peak profit
 
+# ─── STATE ────────────────────────────────────────────────────────────────────
 last_signal        = {}
+entry_price        = {}   # entry price per symbol
+peak_profit        = {}   # peak profit % per symbol
+bot_paused         = False
 bot_status         = {"last_scan": "never", "error": None}
 daily_pnl          = {"date": None, "pnl": 0.0, "trades": 0, "stopped": False}
 processed_exec_ids = set()
@@ -165,8 +171,7 @@ def sync_state_from_bybit():
             headers = sign_get(params)
             r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
                 headers=headers, params=params, timeout=10)
-            result    = r.json()
-            positions = result.get("result", {}).get("list", [])
+            positions = r.json().get("result", {}).get("list", [])
             found     = False
             for pos in positions:
                 size = float(pos.get("size", 0))
@@ -174,15 +179,66 @@ def sync_state_from_bybit():
                     side = pos.get("side")
                     sig  = "buy" if side == "Buy" else "sell"
                     last_signal[symbol] = sig
-                    print(f"[SYNC] {symbol} → {side} size={size} entry={pos.get('avgPrice')} pnl={pos.get('unrealisedPnl')}")
+                    # Restore entry price if not already set
+                    if symbol not in entry_price:
+                        entry_price[symbol] = float(pos.get("avgPrice", 0))
+                        peak_profit[symbol] = 0.0
+                        print(f"[SYNC] Restored entry price: {entry_price[symbol]}")
+                    print(f"[SYNC] {symbol} → {side} size={size} "
+                          f"entry={pos.get('avgPrice')} pnl={pos.get('unrealisedPnl')}")
                     found = True
             if not found:
                 last_signal.pop(symbol, None)
+                entry_price.pop(symbol, None)
+                peak_profit.pop(symbol, None)
                 print(f"[SYNC] {symbol} → no open position")
         except Exception as e:
             print(f"[ERROR] Sync failed {symbol}: {e}")
             traceback.print_exc()
     print(f"[SYNC] State: {last_signal}")
+
+# ─── PEAK RETRACE CHECK ───────────────────────────────────────────────────────
+def check_peak_retrace(symbol):
+    if symbol not in entry_price or symbol not in last_signal:
+        return False
+
+    price = get_price(symbol)
+    if not price:
+        return False
+
+    ep  = entry_price[symbol]
+    sig = last_signal[symbol]
+
+    if ep == 0:
+        return False
+
+    # Current profit %
+    if sig == "buy":
+        current_pct = (price - ep) / ep * 100
+    else:
+        current_pct = (ep - price) / ep * 100
+
+    # Update peak
+    if current_pct > peak_profit.get(symbol, 0):
+        peak_profit[symbol] = current_pct
+        print(f"[PEAK] {symbol} new peak: {round(current_pct, 3)}%")
+
+    peak = peak_profit.get(symbol, 0)
+
+    # Only check retrace if we've been in profit
+    if peak <= 0:
+        return False
+
+    # Check if current profit has retraced 70% from peak
+    retrace_triggered = current_pct <= peak * (1 - RETRACE_PCT)
+
+    print(f"[RETRACE] {symbol} | entry={ep} price={price} | "
+          f"current={round(current_pct,3)}% | "
+          f"peak={round(peak,3)}% | "
+          f"threshold={round(peak*(1-RETRACE_PCT),3)}% | "
+          f"triggered={retrace_triggered}")
+
+    return retrace_triggered
 
 # ─── SIGNAL ───────────────────────────────────────────────────────────────────
 def check_signal(symbol):
@@ -196,7 +252,10 @@ def check_signal(symbol):
     slow_prev  = calc_ema(closes[:-1], EMA_SLOW)
     fast_prev2 = calc_ema(closes[:-2], EMA_FAST)
     slow_prev2 = calc_ema(closes[:-2], EMA_SLOW)
-    print(f"[EMA] {symbol} | C2 {round(fast_prev2,2)}/{round(slow_prev2,2)} | C1 {round(fast_prev,2)}/{round(slow_prev,2)} | NOW {round(fast_now,2)}/{round(slow_now,2)}")
+    print(f"[EMA] {symbol} | "
+          f"C2 {round(fast_prev2,2)}/{round(slow_prev2,2)} | "
+          f"C1 {round(fast_prev,2)}/{round(slow_prev,2)} | "
+          f"NOW {round(fast_now,2)}/{round(slow_now,2)}")
     buy_signal  = (fast_prev2 < slow_prev2 and fast_prev > slow_prev and fast_now > slow_now)
     sell_signal = (fast_prev2 > slow_prev2 and fast_prev < slow_prev and fast_now < slow_now)
     if buy_signal:
@@ -238,6 +297,9 @@ def close_position(symbol):
     if closed:
         time.sleep(1)
         update_daily_pnl(symbol)
+        # Reset peak tracking
+        entry_price.pop(symbol, None)
+        peak_profit.pop(symbol, None)
 
 # ─── PLACE ORDER ──────────────────────────────────────────────────────────────
 def place_order(symbol, signal):
@@ -259,6 +321,10 @@ def place_order(symbol, signal):
             headers=headers, json=body, timeout=10)
         result = r.json()
         print(f"[ORDER] {symbol} {side} qty={qty} @ {price} | {result}")
+        if result.get("retCode") == 0:
+            entry_price[symbol] = price
+            peak_profit[symbol] = 0.0
+            print(f"[ENTRY] {symbol} entry price set: {price}")
         return result
     except Exception as e:
         print(f"[ERROR] Order failed: {e}")
@@ -276,28 +342,54 @@ def run_bot():
     print("=" * 60)
     print("GKC BOT — BTC EMA REVERSAL SYSTEM")
     print(f"Timeframe: {INTERVAL}m | Leverage: {LEVERAGE}x | Size: ${TRADE_USDT}")
+    print(f"Peak retrace exit: {int(RETRACE_PCT*100)}%")
     print("=" * 60)
     sync_state_from_bybit()
     while True:
         try:
             wait_for_candle_close()
             check_daily_reset()
+
             print(f"\n[SCAN] {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
             bot_status["last_scan"] = time.strftime('%Y-%m-%d %H:%M:%S UTC')
-            print(f"[STATUS] PnL=${round(daily_pnl['pnl'],2)} | Trades={daily_pnl['trades']} | Stopped={daily_pnl['stopped']}")
+            print(f"[STATUS] PnL=${round(daily_pnl['pnl'],2)} | "
+                  f"Trades={daily_pnl['trades']} | "
+                  f"Stopped={daily_pnl['stopped']} | "
+                  f"Paused={bot_paused}")
+
+            # Pause check
+            if bot_paused:
+                print("[PAUSED] Bot is paused — skipping signals")
+                continue
+
+            # Daily loss check
             if daily_pnl["stopped"]:
                 print("[RISK] Daily stop active")
                 continue
+
             if daily_pnl["pnl"] <= -MAX_DAILY_LOSS:
                 daily_pnl["stopped"] = True
-                print("[RISK] Max daily loss reached")
+                print("[RISK] Max daily loss reached — closing all")
                 close_all_positions()
                 continue
+
             sync_state_from_bybit()
+
             for symbol in SYMBOLS:
+
+                # ── Peak retrace check (runs every candle) ──
+                if symbol in last_signal:
+                    if check_peak_retrace(symbol):
+                        print(f"[RETRACE] {symbol} — 70% peak retrace hit — closing position")
+                        close_position(symbol)
+                        last_signal.pop(symbol, None)
+                        continue
+
+                # ── Signal check ──
                 signal = check_signal(symbol)
                 prev   = last_signal.get(symbol)
                 print(f"[SIGNAL] {symbol} | current={signal} | previous={prev}")
+
                 if signal and signal != prev:
                     print(f"[ORDER] {symbol} {signal.upper()} confirmed")
                     place_order(symbol, signal)
@@ -305,6 +397,7 @@ def run_bot():
                     bot_status["last_signal"] = last_signal.copy()
                 else:
                     print(f"[HOLD] {symbol} | no confirmed reversal")
+
         except Exception as e:
             bot_status["error"] = str(e)
             print(f"[ERROR] Bot loop: {e}")
@@ -318,12 +411,15 @@ def index():
         "status":      "running",
         "bot":         bot_status,
         "last_signal": last_signal,
+        "entry_price": entry_price,
+        "peak_profit": peak_profit,
         "daily_pnl":   daily_pnl,
         "symbols":     SYMBOLS,
         "interval":    f"{INTERVAL}m",
         "leverage":    LEVERAGE,
         "trade_usdt":  TRADE_USDT,
-        "mode":        "EMA reversal — opposite signal exits"
+        "paused":      bot_paused,
+        "mode":        "EMA flip + 70% peak retrace exit"
     })
 
 @app.route("/status")
@@ -343,16 +439,32 @@ def status():
                         "size":           size,
                         "entry_price":    pos.get("avgPrice"),
                         "unrealised_pnl": pos.get("unrealisedPnl"),
-                        "liq_price":      pos.get("liqPrice")
+                        "liq_price":      pos.get("liqPrice"),
+                        "peak_profit":    round(peak_profit.get(symbol, 0), 3),
                     }
         return jsonify({
             "open_positions": positions,
             "last_signal":    last_signal,
             "last_scan":      bot_status["last_scan"],
-            "daily_pnl":      daily_pnl
+            "daily_pnl":      daily_pnl,
+            "paused":         bot_paused
         })
     except Exception as e:
         return jsonify({"error": str(e)})
+
+@app.route("/pause")
+def pause():
+    global bot_paused
+    bot_paused = True
+    print("[PAUSE] Bot paused by user")
+    return jsonify({"message": "Bot paused — no new orders will be placed"})
+
+@app.route("/resume")
+def resume():
+    global bot_paused
+    bot_paused = False
+    print("[RESUME] Bot resumed by user")
+    return jsonify({"message": "Bot resumed"})
 
 @app.route("/sync")
 def sync():
