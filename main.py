@@ -17,6 +17,7 @@ API_KEY          = os.environ.get("BYBIT_API_KEY")
 API_SECRET       = os.environ.get("BYBIT_API_SECRET")
 BASE_URL_PUBLIC  = "https://api.bybit.com"
 BASE_URL_PRIVATE = "https://api.bybit.com"
+MIN_PROFIT_TO_TRACK = 10.0  # only activate retrace after 5% profit
 
 TRADE_USDT     = 20
 LEVERAGE       = 10
@@ -225,21 +226,23 @@ def check_peak_retrace(symbol):
 
     peak = peak_profit.get(symbol, 0)
 
-    # Only check retrace if we've been in profit
-    if peak <= 0:
+    # Don't activate until minimum profit reached
+    if peak < MIN_PROFIT_TO_TRACK:
+        print(f"[RETRACE] {symbol} peak={round(peak,3)}% — waiting for {MIN_PROFIT_TO_TRACK}% minimum")
         return False
 
-    # Check if current profit has retraced 70% from peak
+    # Check 70% retrace from peak
     retrace_triggered = current_pct <= peak * (1 - RETRACE_PCT)
 
-    print(f"[RETRACE] {symbol} | entry={ep} price={price} | "
+    print(f"[RETRACE] {symbol} | "
+          f"entry={ep} price={price} | "
           f"current={round(current_pct,3)}% | "
           f"peak={round(peak,3)}% | "
           f"threshold={round(peak*(1-RETRACE_PCT),3)}% | "
           f"triggered={retrace_triggered}")
 
     return retrace_triggered
-
+    
 # ─── SIGNAL ───────────────────────────────────────────────────────────────────
 def check_signal(symbol):
     closes = get_candles(symbol)
