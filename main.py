@@ -19,7 +19,7 @@ BASE_URL_PUBLIC  = "https://api.bybit.com"
 BASE_URL_PRIVATE = "https://api.bybit.com"
 
 # ── UPDATED: lower minimum so retrace protection activates earlier ──
-MIN_PROFIT_TO_TRACK = 2.5   # was 10.0 — now protects from 2.5% profit onwards
+MIN_PROFIT_TO_TRACK = 5   # was 10.0 — now protects from 5% profit onwards
 
 # ── PER-SYMBOL CONFIG ─────────────────────────────────────────────────────────
 # Each symbol has its own trade size (USDT) and leverage.
@@ -27,7 +27,7 @@ MIN_PROFIT_TO_TRACK = 2.5   # was 10.0 — now protects from 2.5% profit onwards
 # Edit these freely without touching anything else in the bot.
 SYMBOL_CONFIG = {
     "BTCUSDT":  {"trade_usdt": 20, "leverage": 10},
-    "HYPEUSDT": {"trade_usdt": 20, "leverage": 10},
+    "HYPEUSDT": {"trade_usdt": 15, "leverage": 10},
     "SOLUSDT":  {"trade_usdt": 15, "leverage": 10},
     "WIFUSDT":  {"trade_usdt": 15, "leverage": 10},
 }
@@ -43,7 +43,7 @@ INTERVAL       = "60"
 EMA_FAST       = 12
 EMA_SLOW       = 21
 EMA_WARN       = 34        # EMA(34) used for HLC3 early warning
-MAX_DAILY_LOSS = 50
+MAX_DAILY_LOSS = 30
 RETRACE_PCT    = 0.70      # base retrace — overridden by tiered logic below
 PARTIAL_PCT    = 0.25      # close 25% on early warning
 
