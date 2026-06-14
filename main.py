@@ -19,17 +19,15 @@ BASE_URL_PUBLIC  = "https://api.bybit.com"
 BASE_URL_PRIVATE = "https://api.bybit.com"
 
 # ── UPDATED: lower minimum so retrace protection activates earlier ──
-MIN_PROFIT_TO_TRACK = 5   # was 10.0 — now protects from 5% profit onwards
+MIN_PROFIT_TO_TRACK = 5.0   # retrace protection activates after 5% profit
 
 # ── PER-SYMBOL CONFIG ─────────────────────────────────────────────────────────
-# Each symbol has its own trade size (USDT) and leverage.
-# BTC/HYPE keep the original $20 — SOL/WIF start smaller to manage margin.
-# Edit these freely without touching anything else in the bot.
+# early_warning: set True per symbol when you're ready to use HLC3/EMA34 partial close
 SYMBOL_CONFIG = {
-    "BTCUSDT":  {"trade_usdt": 20, "leverage": 10},
-    "HYPEUSDT": {"trade_usdt": 15, "leverage": 10},
-    "SOLUSDT":  {"trade_usdt": 15, "leverage": 10},
-    "WIFUSDT":  {"trade_usdt": 15, "leverage": 10},
+    "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False},
+    "HYPEUSDT": {"trade_usdt": 20, "leverage": 10, "early_warning": False},
+    "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False},
+    "WIFUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False},
 }
 SYMBOLS = list(SYMBOL_CONFIG.keys())
 
@@ -39,11 +37,14 @@ def get_trade_usdt(symbol):
 def get_leverage(symbol):
     return SYMBOL_CONFIG.get(symbol, {}).get("leverage", 10)
 
+def is_early_warning_on(symbol):
+    return SYMBOL_CONFIG.get(symbol, {}).get("early_warning", False)
+
 INTERVAL       = "60"
 EMA_FAST       = 12
 EMA_SLOW       = 21
 EMA_WARN       = 34        # EMA(34) used for HLC3 early warning
-MAX_DAILY_LOSS = 30
+MAX_DAILY_LOSS = 50
 RETRACE_PCT    = 0.70      # base retrace — overridden by tiered logic below
 PARTIAL_PCT    = 0.25      # close 25% on early warning
 
@@ -474,8 +475,8 @@ def realtime_retrace_monitor():
                         continue
 
                     try:
-                        # ── Early warning: close 25% if HLC3 crosses EMA(34) ──
-                        if symbol not in early_warning_fired:
+                        # ── Early warning: only runs if enabled for this symbol ──
+                        if is_early_warning_on(symbol) and symbol not in early_warning_fired:
                             if check_early_warning(symbol):
                                 print(f"[EARLY WARNING] {symbol} — closing {int(PARTIAL_PCT*100)}% now")
                                 partial_close(symbol, PARTIAL_PCT)
@@ -581,7 +582,8 @@ def index():
         "entry_price":          entry_price,
         "peak_profit":          peak_profit,
         "daily_pnl":            daily_pnl,
-        "symbols":              SYMBOL_CONFIG,
+        "symbols":              {s: {**cfg, "early_warning_fired": s in early_warning_fired}
+                                for s, cfg in SYMBOL_CONFIG.items()},
         "interval":             f"{INTERVAL}m",
         "paused":               bot_paused,
         "early_warning_fired":  list(early_warning_fired),
