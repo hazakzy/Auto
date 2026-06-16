@@ -27,7 +27,7 @@ SYMBOL_CONFIG = {
     "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False},
     "HYPEUSDT": {"trade_usdt": 20, "leverage": 10, "early_warning": False},
     "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False},
-    "WIFUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False},
+    "ETHUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False},
 }
 SYMBOLS = list(SYMBOL_CONFIG.keys())
 
@@ -44,7 +44,7 @@ INTERVAL       = "60"
 EMA_FAST       = 12
 EMA_SLOW       = 21
 EMA_WARN       = 34        # EMA(34) used for HLC3 early warning
-MAX_DAILY_LOSS = 50
+MAX_DAILY_LOSS = 25
 RETRACE_PCT    = 0.70      # base retrace — overridden by tiered logic below
 PARTIAL_PCT    = 0.25      # close 25% on early warning
 
