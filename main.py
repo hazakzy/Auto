@@ -25,7 +25,7 @@ MIN_PROFIT_TO_TRACK = 5.0   # retrace protection activates after 5% profit
 # early_warning: set True per symbol when you're ready to use HLC3/EMA34 partial close
 SYMBOL_CONFIG = {
     "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False},
-    "HYPEUSDT": {"trade_usdt": 20, "leverage": 10, "early_warning": False},
+    "HYPEUSDT": {"trade_usdt": 10, "leverage": 10, "early_warning": False},
     "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False},
     "ETHUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False},
 }
