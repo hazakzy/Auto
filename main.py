@@ -17,6 +17,9 @@ API_KEY          = os.environ.get("BYBIT_API_KEY")
 API_SECRET       = os.environ.get("BYBIT_API_SECRET")
 BASE_URL_PUBLIC  = "https://api.bybit.com"
 BASE_URL_PRIVATE = "https://api.bybit.com"
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5351361684")
+
 
 # ── UPDATED: lower minimum so retrace protection activates earlier ──
 MIN_PROFIT_TO_TRACK = 5.0   # retrace protection activates after 5% profit
@@ -67,6 +70,15 @@ early_warning_fired = set()
 # other is placing a new order on the same symbol.
 # Different symbols can still process concurrently — no unnecessary blocking.
 symbol_locks = {s: threading.Lock() for s in SYMBOL_CONFIG}
+def send_telegram(message):
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        requests.post(url, json=data, timeout=10)
+    except Exception as e:
+        print(f"[TELEGRAM] Error: {e}")
 
 # ─── SIGNATURE ────────────────────────────────────────────────────────────────
 def sign(params):
@@ -409,6 +421,7 @@ def close_position(symbol):
     if closed:
         time.sleep(1)
         update_daily_pnl(symbol)
+        send_telegram(f"🔴 <b>CLOSED</b>\nSymbol: {symbol}\nPeak: {round(peak_profit.get(symbol,0),2)}%\nDaily PnL: ${round(daily_pnl['pnl'], 2)}")
         entry_price.pop(symbol, None)
         peak_profit.pop(symbol, None)
         # Reset early warning so next trade starts fresh
@@ -436,6 +449,7 @@ def place_order(symbol, signal):
         print(f"[ORDER] {symbol} {side} qty={qty} @ {price} | {result}")
         if result.get("retCode") == 0:
             entry_price[symbol] = price
+            send_telegram(f"🟢 <b>NEW TRADE</b>\nSymbol: {symbol}\nSide: {side}\nEntry: ${price}\nDaily PnL: ${round(daily_pnl['pnl'], 2)}")
             peak_profit[symbol] = 0.0
             # Reset early warning for this new trade
             early_warning_fired.discard(symbol)
@@ -485,6 +499,7 @@ def realtime_retrace_monitor():
                         # ── Peak retrace: close remaining position ──
                         if symbol in last_signal and check_peak_retrace(symbol):
                             print(f"[REALTIME RETRACE] {symbol} — closing full position")
+                            send_telegram(f"📉 <b>RETRACE EXIT</b>\nSymbol: {symbol}\nPeak: {round(peak_profit.get(symbol,0),2)}%")
                             close_position(symbol)
                             last_signal.pop(symbol, None)
                     finally:
@@ -530,6 +545,7 @@ def run_bot():
             if daily_pnl["pnl"] <= -MAX_DAILY_LOSS:
                 daily_pnl["stopped"] = True
                 print("[RISK] Max daily loss reached — closing all")
+                send_telegram(f"🚨 <b>DAILY LOSS LIMIT HIT</b>\nLoss: ${round(daily_pnl['pnl'],2)}\nBot stopped for today")
                 close_all_positions()
                 continue
 
