@@ -29,7 +29,7 @@ MIN_PROFIT_TO_TRACK = 5.0
 # early_warning: True = enables HLC3/EMA34 partial close for this symbol
 SYMBOL_CONFIG = {
     "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False, "paused": False},
-    "HYPEUSDT": {"trade_usdt": 10, "leverage": 10, "early_warning": False, "paused": False},
+    "HYPEUSDT": {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
     "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
     "ETHUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
 }
@@ -57,8 +57,8 @@ PARTIAL_PCT    = 0.25
 
 # ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
 # All upgrades OFF by default — enable one at a time to test independently
-ENABLE_ADX_FILTER     = False  # Skip signals when market is ranging (ADX < threshold)
-ENABLE_TRADE_LOGGING  = False  # Log every trade entry/exit to CSV for analysis
+ENABLE_ADX_FILTER     = True  # Skip signals when market is ranging (ADX < threshold)
+ENABLE_TRADE_LOGGING  = True  # Log every trade entry/exit to CSV for analysis
 ENABLE_HARD_STOP_LOSS = False  # Close if loss exceeds STOP_LOSS_PCT from entry
 ENABLE_DUAL_TIMEFRAME = False  # Require 15m EMA to agree with 60m before entering
 
@@ -653,7 +653,6 @@ def place_order(symbol, signal):
                 f"Symbol: {symbol}\n"
                 f"Side: {side}\n"
                 f"Entry: ${price}\n"
-                f"Size: ${get_trade_usdt(symbol)} x {get_leverage(symbol)}x\n"
                 f"Daily PnL: ${round(daily_pnl['pnl'], 2)}"
             )
         return result
