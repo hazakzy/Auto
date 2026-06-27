@@ -3,6 +3,7 @@ import json
 import hmac
 import hashlib
 import time
+import csv
 import requests
 import threading
 import traceback
@@ -17,20 +18,20 @@ API_KEY          = os.environ.get("BYBIT_API_KEY")
 API_SECRET       = os.environ.get("BYBIT_API_SECRET")
 BASE_URL_PUBLIC  = "https://api.bybit.com"
 BASE_URL_PRIVATE = "https://api.bybit.com"
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5351361684")
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "@cryptoedgelab")
+TELEGRAM_PRIVATE_ID = os.environ.get("TELEGRAM_PRIVATE_ID", "5351361684")
 
-
-# ── UPDATED: lower minimum so retrace protection activates earlier ──
-MIN_PROFIT_TO_TRACK = 5.0   # retrace protection activates after 5% profit
+MIN_PROFIT_TO_TRACK = 5.0
 
 # ── PER-SYMBOL CONFIG ─────────────────────────────────────────────────────────
-# early_warning: set True per symbol when you're ready to use HLC3/EMA34 partial close
+# paused: True = bot skips this symbol entirely (no new trades, no closes)
+# early_warning: True = enables HLC3/EMA34 partial close for this symbol
 SYMBOL_CONFIG = {
-    "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False},
-    "HYPEUSDT": {"trade_usdt": 10, "leverage": 10, "early_warning": False},
-    "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False},
-    "ETHUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False},
+    "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False, "paused": False},
+    "HYPEUSDT": {"trade_usdt": 10, "leverage": 10, "early_warning": False, "paused": False},
+    "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
+    "ETHUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
 }
 SYMBOLS = list(SYMBOL_CONFIG.keys())
 
@@ -43,40 +44,56 @@ def get_leverage(symbol):
 def is_early_warning_on(symbol):
     return SYMBOL_CONFIG.get(symbol, {}).get("early_warning", False)
 
+def is_symbol_paused(symbol):
+    return SYMBOL_CONFIG.get(symbol, {}).get("paused", False)
+
 INTERVAL       = "60"
 EMA_FAST       = 12
 EMA_SLOW       = 21
-EMA_WARN       = 34        # EMA(34) used for HLC3 early warning
+EMA_WARN       = 34
 MAX_DAILY_LOSS = 25
-RETRACE_PCT    = 0.70      # base retrace — overridden by tiered logic below
-PARTIAL_PCT    = 0.25      # close 25% on early warning
+RETRACE_PCT    = 0.70
+PARTIAL_PCT    = 0.25
+
+# ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
+# All upgrades OFF by default — enable one at a time to test independently
+ENABLE_ADX_FILTER     = False  # Skip signals when market is ranging (ADX < threshold)
+ENABLE_TRADE_LOGGING  = False  # Log every trade entry/exit to CSV for analysis
+ENABLE_HARD_STOP_LOSS = False  # Close if loss exceeds STOP_LOSS_PCT from entry
+ENABLE_DUAL_TIMEFRAME = False  # Require 15m EMA to agree with 60m before entering
+
+# ── Feature settings ──
+ADX_PERIOD       = 14
+ADX_THRESHOLD    = 20
+STOP_LOSS_PCT    = 4.0
+DUAL_TF_INTERVAL = "15"
+LOG_FILE         = "/tmp/gkc_trades.csv"
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
-last_signal        = {}
-entry_price        = {}
-peak_profit        = {}
-bot_paused         = False
-bot_status         = {"last_scan": "never", "error": None}
-daily_pnl          = {"date": None, "pnl": 0.0, "trades": 0, "stopped": False}
-processed_exec_ids = set()
-
-# NEW: track which symbols have already had their early warning partial close fired
-# prevents the bot firing 25% close every 45s on the same warning
-early_warning_fired = set()
+last_signal          = {}
+entry_price          = {}
+peak_profit          = {}
+bot_paused           = False
+bot_status           = {"last_scan": "never", "error": None}
+daily_pnl            = {"date": None, "pnl": 0.0, "trades": 0, "stopped": False}
+processed_exec_ids   = set()
+early_warning_fired  = set()
+early_signal_alerted = {}
 
 # ─── THREAD SAFETY ────────────────────────────────────────────────────────────
-# One lock per symbol. Prevents the realtime monitor and the main bot loop from
-# acting on the same position simultaneously — e.g. one thread closing while the
-# other is placing a new order on the same symbol.
-# Different symbols can still process concurrently — no unnecessary blocking.
 symbol_locks = {s: threading.Lock() for s in SYMBOL_CONFIG}
-def send_telegram(message):
+
+# ─── TELEGRAM ─────────────────────────────────────────────────────────────────
+def send_telegram(message, private=False):
     if not TELEGRAM_TOKEN:
         return
     try:
-        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        requests.post(url, json=data, timeout=10)
+        chat_id = TELEGRAM_PRIVATE_ID if private else TELEGRAM_CHAT_ID
+        url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data    = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        r       = requests.post(url, json=data, timeout=10)
+        if r.status_code != 200:
+            print(f"[TELEGRAM] Failed: {r.text}")
     except Exception as e:
         print(f"[TELEGRAM] Error: {e}")
 
@@ -117,14 +134,14 @@ def calc_ema(prices, period):
     return ema
 
 # ─── MARKET DATA ──────────────────────────────────────────────────────────────
-# UPDATED: now returns (highs, lows, closes) — needed for HLC3 early warning
-def get_candles(symbol):
+def get_candles(symbol, interval=None):
+    tf = interval or INTERVAL
     for attempt in range(3):
         try:
             r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/kline", params={
                 "category": "linear",
                 "symbol":   symbol,
-                "interval": INTERVAL,
+                "interval": tf,
                 "limit":    150
             }, timeout=10)
             candles = r.json()["result"]["list"]
@@ -181,6 +198,7 @@ def check_daily_reset():
         daily_pnl["trades"]  = 0
         daily_pnl["stopped"] = False
         processed_exec_ids.clear()
+        early_signal_alerted.clear()
         print(f"[RESET] Daily reset for {today}")
 
 # ─── DAILY PNL ────────────────────────────────────────────────────────────────
@@ -214,7 +232,6 @@ def update_daily_pnl(symbol):
 def sync_state_from_bybit():
     print("[SYNC] Syncing positions from Bybit")
     for symbol in SYMBOLS:
-        # Acquire lock so realtime monitor can't act on this symbol mid-sync
         lock = symbol_locks.get(symbol)
         with lock:
             try:
@@ -248,86 +265,245 @@ def sync_state_from_bybit():
                 traceback.print_exc()
     print(f"[SYNC] State: {last_signal}")
 
-# ─── TIERED RETRACE THRESHOLD (NEW) ──────────────────────────────────────────
-# The bigger your profit, the tighter the trail — protects big winners more
+# ─── TIERED RETRACE ───────────────────────────────────────────────────────────
 def get_retrace_threshold(peak):
-    if peak >= 20:   return 0.35   # up 20%+ → only allow 35% giveback
-    elif peak >= 10: return 0.50   # up 10–20% → allow 50% giveback
-    elif peak >= 5:  return 0.60   # up 5–10% → allow 60% giveback
-    else:            return 0.70   # up 2.5–5% → allow 70% giveback (base)
+    if peak >= 20:   return 0.35
+    elif peak >= 10: return 0.50
+    elif peak >= 5:  return 0.60
+    else:            return 0.70
 
-# ─── PEAK RETRACE CHECK (UPDATED: uses tiered threshold) ─────────────────────
+# ─── PEAK RETRACE CHECK ───────────────────────────────────────────────────────
 def check_peak_retrace(symbol):
     if symbol not in entry_price or symbol not in last_signal:
         return False
-
     price = get_price(symbol)
     if not price:
         return False
-
     ep  = entry_price[symbol]
     sig = last_signal[symbol]
-
     if ep == 0:
         return False
-
     if sig == "buy":
         current_pct = (price - ep) / ep * 100
     else:
         current_pct = (ep - price) / ep * 100
-
     if current_pct > peak_profit.get(symbol, 0):
         peak_profit[symbol] = current_pct
         print(f"[PEAK] {symbol} new peak: {round(current_pct, 3)}%")
-
     peak = peak_profit.get(symbol, 0)
-
     if peak < MIN_PROFIT_TO_TRACK:
         print(f"[RETRACE] {symbol} peak={round(peak,3)}% — waiting for {MIN_PROFIT_TO_TRACK}% minimum")
         return False
-
-    # UPDATED: tiered threshold instead of flat 70%
     threshold         = get_retrace_threshold(peak)
     retrace_triggered = current_pct <= peak * (1 - threshold)
-
-    print(f"[RETRACE] {symbol} | "
-          f"entry={ep} price={price} | "
-          f"current={round(current_pct,3)}% | "
-          f"peak={round(peak,3)}% | "
+    print(f"[RETRACE] {symbol} | entry={ep} price={price} | "
+          f"current={round(current_pct,3)}% | peak={round(peak,3)}% | "
           f"allowedGiveback={int(threshold*100)}% | "
-          f"threshold={round(peak*(1-threshold),3)}% | "
-          f"triggered={retrace_triggered}")
-
+          f"threshold={round(peak*(1-threshold),3)}% | triggered={retrace_triggered}")
     return retrace_triggered
 
-# ─── EMA(34) HLC3 EARLY WARNING (NEW) ────────────────────────────────────────
-# Translated from CM_EMA Trend Bars Pine Script by ChrisMoody
-# hlc3 = (high + low + close) / 3 — more sensitive than close alone
-# Fires 2–4 candles before the 12/21 EMA crossover confirms reversal
+# ─── EMA(34) HLC3 EARLY WARNING ───────────────────────────────────────────────
 def check_early_warning(symbol):
     if symbol not in last_signal:
         return False
-
     highs, lows, closes = get_candles(symbol)
     if len(closes) < EMA_WARN + 5:
         return False
-
     hlc3   = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
     ema34  = calc_ema(hlc3, EMA_WARN)
     last_h = hlc3[-1]
     sig    = last_signal[symbol]
-
     if sig == "buy" and last_h < ema34:
-        print(f"[WARN] {symbol} HLC3 {round(last_h,4)} < EMA34 {round(ema34,4)} — bearish early warning")
+        print(f"[WARN] {symbol} HLC3 {round(last_h,4)} < EMA34 {round(ema34,4)} — bearish")
         return True
     if sig == "sell" and last_h >= ema34:
-        print(f"[WARN] {symbol} HLC3 {round(last_h,4)} >= EMA34 {round(ema34,4)} — bullish early warning")
+        print(f"[WARN] {symbol} HLC3 {round(last_h,4)} >= EMA34 {round(ema34,4)} — bullish")
         return True
-
     return False
 
-# ─── PARTIAL CLOSE (NEW) ──────────────────────────────────────────────────────
-# Closes a percentage of the open position using reduceOnly — safe, won't open new trades
+# ─── EARLY SIGNAL ALERT ───────────────────────────────────────────────────────
+def check_early_signal_alert(symbol, closes):
+    if len(closes) < EMA_SLOW + 5:
+        return
+    fast    = calc_ema(closes, EMA_FAST)
+    slow    = calc_ema(closes, EMA_SLOW)
+    gap_pct = abs(fast - slow) / slow * 100
+    if gap_pct > 0.15:
+        early_signal_alerted.pop(symbol, None)
+        return
+    direction = "BUY 🟢" if fast > slow else "SELL 🔴"
+    alert_key = f"{symbol}_{direction}"
+    if early_signal_alerted.get(symbol) == alert_key:
+        return
+    early_signal_alerted[symbol] = alert_key
+    current_pos = last_signal.get(symbol, "none")
+    print(f"[EARLY SIGNAL] {symbol} EMAs converging — possible {direction} incoming")
+    send_telegram(
+        f"👀 <b>EARLY SIGNAL ALERT</b>\n"
+        f"Symbol: {symbol}\n"
+        f"Direction: {direction}\n"
+        f"Price: ${round(closes[-1], 4)}\n"
+        f"EMA gap: {round(gap_pct, 3)}%\n"
+        f"Current position: {current_pos}\n"
+        f"⚠️ Not yet confirmed — bot waiting for candle close",
+        private=True
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ─── UPGRADE #1 — ADX FILTER (PAUSED) ────────────────────────────────────────
+# Enable: ENABLE_ADX_FILTER = True
+# ═══════════════════════════════════════════════════════════════════════════════
+def calc_adx(highs, lows, closes, period=ADX_PERIOD):
+    if len(closes) < period * 2:
+        return 0
+    try:
+        tr_list, pdm_list, ndm_list = [], [], []
+        for i in range(1, len(closes)):
+            high, low, prev_close = highs[i], lows[i], closes[i-1]
+            tr  = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            pdm = max(highs[i] - highs[i-1], 0) if (highs[i] - highs[i-1]) > (lows[i-1] - lows[i]) else 0
+            ndm = max(lows[i-1] - lows[i], 0) if (lows[i-1] - lows[i]) > (highs[i] - highs[i-1]) else 0
+            tr_list.append(tr)
+            pdm_list.append(pdm)
+            ndm_list.append(ndm)
+        def wilder_smooth(data, p):
+            s = sum(data[:p])
+            result = [s]
+            for v in data[p:]:
+                s = s - s / p + v
+                result.append(s)
+            return result
+        atr  = wilder_smooth(tr_list,  period)
+        pDM  = wilder_smooth(pdm_list, period)
+        nDM  = wilder_smooth(ndm_list, period)
+        dx_list = []
+        for i in range(len(atr)):
+            if atr[i] == 0:
+                continue
+            pDI = 100 * pDM[i] / atr[i]
+            nDI = 100 * nDM[i] / atr[i]
+            dx  = 100 * abs(pDI - nDI) / (pDI + nDI) if (pDI + nDI) != 0 else 0
+            dx_list.append(dx)
+        if not dx_list:
+            return 0
+        return round(sum(dx_list[-period:]) / period, 2)
+    except Exception as e:
+        print(f"[ADX] Calc error: {e}")
+        return 0
+
+def adx_filter_passes(symbol, highs, lows, closes):
+    if not ENABLE_ADX_FILTER:
+        return True
+    adx     = calc_adx(highs, lows, closes)
+    passes  = adx >= ADX_THRESHOLD
+    print(f"[ADX] {symbol} ADX={adx} | threshold={ADX_THRESHOLD} | trending={passes}")
+    if not passes:
+        send_telegram(
+            f"⏸️ <b>SIGNAL SKIPPED — ADX FILTER</b>\n"
+            f"Symbol: {symbol}\n"
+            f"ADX: {adx} (below {ADX_THRESHOLD})\n"
+            f"Market ranging — waiting for trend",
+            private=True
+        )
+    return passes
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ─── UPGRADE #2 — TRADE LOGGING (PAUSED) ─────────────────────────────────────
+# Enable: ENABLE_TRADE_LOGGING = True
+# ═══════════════════════════════════════════════════════════════════════════════
+def init_log():
+    if not ENABLE_TRADE_LOGGING:
+        return
+    try:
+        if not os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp", "symbol", "action", "side",
+                    "price", "qty", "peak_profit_pct",
+                    "closed_pnl", "daily_pnl", "reason"
+                ])
+            print(f"[LOG] Trade log created: {LOG_FILE}")
+    except Exception as e:
+        print(f"[LOG] Init error: {e}")
+
+def log_trade(symbol, action, side, price, qty=0, peak=0, closed_pnl=0, reason=""):
+    if not ENABLE_TRADE_LOGGING:
+        return
+    try:
+        with open(LOG_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                symbol, action, side, price, qty,
+                round(peak, 3), round(closed_pnl, 4),
+                round(daily_pnl["pnl"], 4), reason
+            ])
+        print(f"[LOG] {action} logged for {symbol}")
+    except Exception as e:
+        print(f"[LOG] Write error: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ─── UPGRADE #3 — HARD STOP LOSS (PAUSED) ────────────────────────────────────
+# Enable: ENABLE_HARD_STOP_LOSS = True
+# ═══════════════════════════════════════════════════════════════════════════════
+def check_hard_stop(symbol):
+    if not ENABLE_HARD_STOP_LOSS:
+        return False
+    if symbol not in entry_price or symbol not in last_signal:
+        return False
+    price = get_price(symbol)
+    if not price:
+        return False
+    ep  = entry_price[symbol]
+    sig = last_signal[symbol]
+    if ep == 0:
+        return False
+    loss_pct = (ep - price) / ep * 100 if sig == "buy" else (price - ep) / ep * 100
+    if loss_pct >= STOP_LOSS_PCT:
+        print(f"[STOP] {symbol} hard stop hit — loss={round(loss_pct,3)}%")
+        send_telegram(
+            f"🛑 <b>HARD STOP LOSS</b>\n"
+            f"Symbol: {symbol}\n"
+            f"Entry: ${ep} | Current: ${price}\n"
+            f"Loss: {round(loss_pct, 2)}%\n"
+            f"Closing position now",
+            private=True
+        )
+        return True
+    return False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ─── UPGRADE #4 — DUAL TIMEFRAME (PAUSED) ────────────────────────────────────
+# Enable: ENABLE_DUAL_TIMEFRAME = True
+# ═══════════════════════════════════════════════════════════════════════════════
+def dual_tf_confirms(symbol, signal):
+    if not ENABLE_DUAL_TIMEFRAME:
+        return True
+    try:
+        _, _, closes_15m = get_candles(symbol, interval=DUAL_TF_INTERVAL)
+        if len(closes_15m) < EMA_SLOW + 5:
+            print(f"[DUAL TF] {symbol} not enough 15m candles — skipping filter")
+            return True
+        fast_15m = calc_ema(closes_15m, EMA_FAST)
+        slow_15m = calc_ema(closes_15m, EMA_SLOW)
+        agrees   = fast_15m > slow_15m if signal == "buy" else fast_15m < slow_15m
+        print(f"[DUAL TF] {symbol} | 15m EMA {round(fast_15m,4)}/{round(slow_15m,4)} | "
+              f"signal={signal} | agrees={agrees}")
+        if not agrees:
+            send_telegram(
+                f"⏸️ <b>SIGNAL SKIPPED — DUAL TF</b>\n"
+                f"Symbol: {symbol}\n"
+                f"60m signal: {signal.upper()}\n"
+                f"15m EMA disagrees — waiting for alignment",
+                private=True
+            )
+        return agrees
+    except Exception as e:
+        print(f"[DUAL TF] Error {symbol}: {e}")
+        return True
+
+# ─── PARTIAL CLOSE ────────────────────────────────────────────────────────────
 def partial_close(symbol, pct=PARTIAL_PCT):
     try:
         params  = {"category": "linear", "symbol": symbol}
@@ -337,38 +513,40 @@ def partial_close(symbol, pct=PARTIAL_PCT):
         for pos in r.json().get("result", {}).get("list", []):
             size = float(pos.get("size", 0))
             if size > 0:
-                precision = get_qty_precision(symbol)
-                close_qty = round(size * pct, precision)
+                precision  = get_qty_precision(symbol)
+                close_qty  = round(size * pct, precision)
                 if close_qty <= 0:
                     print(f"[PARTIAL] {symbol} qty too small, skipping")
                     return
                 close_side = "Sell" if pos["side"] == "Buy" else "Buy"
                 body       = {
-                    "category":   "linear",
-                    "symbol":     symbol,
-                    "side":       close_side,
-                    "orderType":  "Market",
-                    "qty":        str(close_qty),
-                    "reduceOnly": True
+                    "category": "linear", "symbol": symbol,
+                    "side": close_side, "orderType": "Market",
+                    "qty": str(close_qty), "reduceOnly": True
                 }
                 headers2 = sign(body)
                 r2 = requests.post(f"{BASE_URL_PRIVATE}/v5/order/create",
                     headers=headers2, json=body, timeout=10)
-                print(f"[PARTIAL] {symbol} closed {int(pct*100)}% "
-                      f"({close_qty} of {size}) | {r2.json()}")
+                print(f"[PARTIAL] {symbol} closed {int(pct*100)}% ({close_qty} of {size}) | {r2.json()}")
                 time.sleep(1)
                 update_daily_pnl(symbol)
+                send_telegram(
+                    f"⚠️ <b>EARLY WARNING — PARTIAL CLOSE</b>\n"
+                    f"Symbol: {symbol}\n"
+                    f"Closed: {int(pct*100)}% ({close_qty} of {size})\n"
+                    f"HLC3 crossed EMA34 — possible reversal ahead\n"
+                    f"Daily PnL: ${round(daily_pnl['pnl'], 2)}"
+                )
     except Exception as e:
         print(f"[ERROR] Partial close failed {symbol}: {e}")
         traceback.print_exc()
 
 # ─── SIGNAL ───────────────────────────────────────────────────────────────────
-# UPDATED: unpacks (highs, lows, closes) from get_candles
 def check_signal(symbol):
     highs, lows, closes = get_candles(symbol)
     if len(closes) < EMA_SLOW + 5:
         print(f"[ERROR] Not enough candles for {symbol}")
-        return None
+        return None, None, None, None
     fast_now   = calc_ema(closes,      EMA_FAST)
     slow_now   = calc_ema(closes,      EMA_SLOW)
     fast_prev  = calc_ema(closes[:-1], EMA_FAST)
@@ -379,13 +557,14 @@ def check_signal(symbol):
           f"C2 {round(fast_prev2,2)}/{round(slow_prev2,2)} | "
           f"C1 {round(fast_prev,2)}/{round(slow_prev,2)} | "
           f"NOW {round(fast_now,2)}/{round(slow_now,2)}")
+    check_early_signal_alert(symbol, closes)
     buy_signal  = (fast_prev2 < slow_prev2 and fast_prev > slow_prev and fast_now > slow_now)
     sell_signal = (fast_prev2 > slow_prev2 and fast_prev < slow_prev and fast_now < slow_now)
     if buy_signal:
-        return "buy"
+        return "buy", highs, lows, closes
     if sell_signal:
-        return "sell"
-    return None
+        return "sell", highs, lows, closes
+    return None, highs, lows, closes
 
 # ─── LEVERAGE ─────────────────────────────────────────────────────────────────
 def set_leverage(symbol):
@@ -400,16 +579,20 @@ def set_leverage(symbol):
         print(f"[WARN] Leverage {symbol}: {result}")
 
 # ─── CLOSE POSITION ───────────────────────────────────────────────────────────
-def close_position(symbol):
+def close_position(symbol, reason="signal"):
     params  = {"category": "linear", "symbol": symbol}
     headers = sign_get(params)
     r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
         headers=headers, params=params, timeout=10)
-    closed = False
+    closed     = False
+    close_qty  = 0
+    close_side_str = ""
     for pos in r.json().get("result", {}).get("list", []):
         size = float(pos.get("size", 0))
         if size > 0:
-            close_side = "Sell" if pos["side"] == "Buy" else "Buy"
+            close_side     = "Sell" if pos["side"] == "Buy" else "Buy"
+            close_side_str = close_side
+            close_qty      = size
             body    = {"category": "linear", "symbol": symbol,
                        "side": close_side, "orderType": "Market",
                        "qty": str(size), "reduceOnly": True}
@@ -421,17 +604,28 @@ def close_position(symbol):
     if closed:
         time.sleep(1)
         update_daily_pnl(symbol)
-        send_telegram(f"🔴 <b>CLOSED</b>\nSymbol: {symbol}\nPeak: {round(peak_profit.get(symbol,0),2)}%\nDaily PnL: ${round(daily_pnl['pnl'], 2)}")
+        pk = round(peak_profit.get(symbol, 0), 2)
+        ep = entry_price.get(symbol, 0)
+        log_trade(symbol, "EXIT", close_side_str, get_price(symbol) or 0,
+                  close_qty, pk, daily_pnl["pnl"], reason)
         entry_price.pop(symbol, None)
         peak_profit.pop(symbol, None)
-        # Reset early warning so next trade starts fresh
         early_warning_fired.discard(symbol)
+        early_signal_alerted.pop(symbol, None)
+        send_telegram(
+            f"🔴 <b>POSITION CLOSED</b>\n"
+            f"Symbol: {symbol}\n"
+            f"Entry was: ${ep}\n"
+            f"Peak profit: {pk}%\n"
+            f"Reason: {reason}\n"
+            f"Daily PnL: ${round(daily_pnl['pnl'], 2)}"
+        )
 
 # ─── PLACE ORDER ──────────────────────────────────────────────────────────────
 def place_order(symbol, signal):
     try:
         set_leverage(symbol)
-        close_position(symbol)
+        close_position(symbol, reason="signal flip")
         price = get_price(symbol)
         if not price:
             print(f"[ERROR] Price fetch failed for {symbol}")
@@ -449,11 +643,19 @@ def place_order(symbol, signal):
         print(f"[ORDER] {symbol} {side} qty={qty} @ {price} | {result}")
         if result.get("retCode") == 0:
             entry_price[symbol] = price
-            send_telegram(f"🟢 <b>NEW TRADE</b>\nSymbol: {symbol}\nSide: {side}\nEntry: ${price}\nDaily PnL: ${round(daily_pnl['pnl'], 2)}")
             peak_profit[symbol] = 0.0
-            # Reset early warning for this new trade
             early_warning_fired.discard(symbol)
+            early_signal_alerted.pop(symbol, None)
             print(f"[ENTRY] {symbol} entry price set: {price}")
+            log_trade(symbol, "ENTRY", side, price, qty, reason="EMA crossover")
+            send_telegram(
+                f"🟢 <b>NEW TRADE</b>\n"
+                f"Symbol: {symbol}\n"
+                f"Side: {side}\n"
+                f"Entry: ${price}\n"
+                f"Size: ${get_trade_usdt(symbol)} x {get_leverage(symbol)}x\n"
+                f"Daily PnL: ${round(daily_pnl['pnl'], 2)}"
+            )
         return result
     except Exception as e:
         print(f"[ERROR] Order failed {symbol}: {e}")
@@ -464,63 +666,72 @@ def close_all_positions():
     for symbol in SYMBOLS:
         lock = symbol_locks.get(symbol)
         with lock:
-            close_position(symbol)
+            close_position(symbol, reason="close all")
             last_signal.pop(symbol, None)
     print("[RISK] All positions closed")
 
-# ─── REAL-TIME MONITOR (NEW) ──────────────────────────────────────────────────
-# Runs every 45 seconds in a background thread
-# Checks: (1) early warning → 25% partial close, (2) retrace → full close
-# This fills the 60-minute blind spot between candle closes
+# ─── REAL-TIME MONITOR ────────────────────────────────────────────────────────
 def realtime_retrace_monitor():
     print("[MONITOR] Real-time monitor started — checking every 45s")
     while True:
         try:
             if not bot_paused and not daily_pnl["stopped"]:
                 for symbol in list(last_signal.keys()):
+                    # Skip if this symbol is individually paused
+                    if is_symbol_paused(symbol):
+                        continue
                     lock = symbol_locks.get(symbol)
                     if not lock:
                         continue
-
-                    # Acquire lock — blocks if main loop is currently acting on this symbol
-                    # Non-blocking try: skip this symbol this cycle rather than pile up
                     if not lock.acquire(blocking=False):
-                        print(f"[MONITOR] {symbol} locked by main loop — skipping this cycle")
+                        print(f"[MONITOR] {symbol} locked — skipping this cycle")
                         continue
-
                     try:
-                        # ── Early warning: only runs if enabled for this symbol ──
+                        # Hard stop loss check
+                        if check_hard_stop(symbol):
+                            close_position(symbol, reason="hard stop loss")
+                            last_signal.pop(symbol, None)
+                            continue
+                        # Early warning partial close
                         if is_early_warning_on(symbol) and symbol not in early_warning_fired:
                             if check_early_warning(symbol):
-                                print(f"[EARLY WARNING] {symbol} — closing {int(PARTIAL_PCT*100)}% now")
+                                print(f"[EARLY WARNING] {symbol} — closing {int(PARTIAL_PCT*100)}%")
                                 partial_close(symbol, PARTIAL_PCT)
                                 early_warning_fired.add(symbol)
-
-                        # ── Peak retrace: close remaining position ──
+                        # Peak retrace full close
                         if symbol in last_signal and check_peak_retrace(symbol):
                             print(f"[REALTIME RETRACE] {symbol} — closing full position")
-                            send_telegram(f"📉 <b>RETRACE EXIT</b>\nSymbol: {symbol}\nPeak: {round(peak_profit.get(symbol,0),2)}%")
-                            close_position(symbol)
+                            send_telegram(
+                                f"📉 <b>RETRACE EXIT</b>\n"
+                                f"Symbol: {symbol}\n"
+                                f"Peak profit: {round(peak_profit.get(symbol,0),2)}%\n"
+                                f"Price retraced past threshold"
+                            )
+                            close_position(symbol, reason="retrace")
                             last_signal.pop(symbol, None)
                     finally:
                         lock.release()
-
         except Exception as e:
             print(f"[ERROR] Realtime monitor: {e}")
             traceback.print_exc()
-
         time.sleep(45)
 
 # ─── BOT LOOP ─────────────────────────────────────────────────────────────────
 def run_bot():
     print("=" * 60)
-    print("GKC BOT — EMA REVERSAL + HLC3 EARLY WARNING SYSTEM")
-    print(f"Timeframe: {INTERVAL}m")
+    print("GKC BOT — EMA REVERSAL SYSTEM")
+    print(f"Timeframe: {INTERVAL}m | Min profit: {MIN_PROFIT_TO_TRACK}%")
+    print("SYMBOLS:")
     for s, cfg in SYMBOL_CONFIG.items():
-        print(f"  {s}: ${cfg['trade_usdt']} x {cfg['leverage']}x leverage")
-    print(f"Early warning: EMA({EMA_WARN}) on HLC3 → {int(PARTIAL_PCT*100)}% partial close")
-    print(f"Peak retrace: tiered (35–70%) | Min profit: {MIN_PROFIT_TO_TRACK}%")
+        status = "PAUSED" if cfg.get("paused") else f"${cfg['trade_usdt']} x {cfg['leverage']}x"
+        print(f"  {s}: {status}")
+    print("FEATURE FLAGS:")
+    print(f"  ADX Filter:      {'ON' if ENABLE_ADX_FILTER     else 'OFF'}")
+    print(f"  Trade Logging:   {'ON' if ENABLE_TRADE_LOGGING  else 'OFF'}")
+    print(f"  Hard Stop Loss:  {'ON' if ENABLE_HARD_STOP_LOSS else 'OFF'}")
+    print(f"  Dual Timeframe:  {'ON' if ENABLE_DUAL_TIMEFRAME else 'OFF'}")
     print("=" * 60)
+    init_log()
     sync_state_from_bybit()
     while True:
         try:
@@ -531,11 +742,10 @@ def run_bot():
             bot_status["last_scan"] = time.strftime('%Y-%m-%d %H:%M:%S UTC')
             print(f"[STATUS] PnL=${round(daily_pnl['pnl'],2)} | "
                   f"Trades={daily_pnl['trades']} | "
-                  f"Stopped={daily_pnl['stopped']} | "
-                  f"Paused={bot_paused}")
+                  f"Stopped={daily_pnl['stopped']} | Paused={bot_paused}")
 
             if bot_paused:
-                print("[PAUSED] Bot is paused — skipping signals")
+                print("[PAUSED] Bot is paused — skipping all signals")
                 continue
 
             if daily_pnl["stopped"]:
@@ -545,36 +755,52 @@ def run_bot():
             if daily_pnl["pnl"] <= -MAX_DAILY_LOSS:
                 daily_pnl["stopped"] = True
                 print("[RISK] Max daily loss reached — closing all")
-                send_telegram(f"🚨 <b>DAILY LOSS LIMIT HIT</b>\nLoss: ${round(daily_pnl['pnl'],2)}\nBot stopped for today")
+                send_telegram(
+                    f"🚨 <b>DAILY LOSS LIMIT HIT</b>\n"
+                    f"Loss: ${round(daily_pnl['pnl'],2)}\n"
+                    f"Limit: -${MAX_DAILY_LOSS}\n"
+                    f"All positions closing — bot stopped for today",
+                    private=True
+                )
                 close_all_positions()
                 continue
 
             sync_state_from_bybit()
 
             for symbol in SYMBOLS:
+                # ── Per-symbol pause check ──
+                if is_symbol_paused(symbol):
+                    print(f"[PAUSED] {symbol} is paused — skipping")
+                    continue
+
                 lock = symbol_locks.get(symbol)
                 if not lock:
                     continue
 
-                # Blocking acquire — main loop always waits for the lock.
-                # This ensures the realtime monitor finishes any in-progress
-                # close before we try to place a new order on the same symbol.
                 with lock:
-
-                    # ── Peak retrace check at candle close (backup for realtime) ──
+                    # Peak retrace backup at candle close
                     if symbol in last_signal:
                         if check_peak_retrace(symbol):
-                            print(f"[RETRACE] {symbol} — closing position at candle")
-                            close_position(symbol)
+                            print(f"[RETRACE] {symbol} — closing at candle")
+                            close_position(symbol, reason="retrace at candle")
                             last_signal.pop(symbol, None)
                             continue
 
-                    # ── EMA 12/21 signal check ──
-                    signal = check_signal(symbol)
-                    prev   = last_signal.get(symbol)
+                    # EMA signal check
+                    signal, highs, lows, closes = check_signal(symbol)
+                    prev = last_signal.get(symbol)
                     print(f"[SIGNAL] {symbol} | current={signal} | previous={prev}")
 
                     if signal and signal != prev:
+                        # ADX filter
+                        if not adx_filter_passes(symbol, highs, lows, closes):
+                            print(f"[ADX] {symbol} signal skipped — ranging market")
+                            continue
+                        # Dual timeframe filter
+                        if not dual_tf_confirms(symbol, signal):
+                            print(f"[DUAL TF] {symbol} signal skipped — 15m disagrees")
+                            continue
+
                         print(f"[ORDER] {symbol} {signal.upper()} confirmed")
                         place_order(symbol, signal)
                         last_signal[symbol] = signal
@@ -592,18 +818,22 @@ def run_bot():
 @app.route("/")
 def index():
     return jsonify({
-        "status":               "running",
-        "bot":                  bot_status,
-        "last_signal":          last_signal,
-        "entry_price":          entry_price,
-        "peak_profit":          peak_profit,
-        "daily_pnl":            daily_pnl,
-        "symbols":              {s: {**cfg, "early_warning_fired": s in early_warning_fired}
-                                for s, cfg in SYMBOL_CONFIG.items()},
-        "interval":             f"{INTERVAL}m",
-        "paused":               bot_paused,
-        "early_warning_fired":  list(early_warning_fired),
-        "mode":                 "EMA 12/21 flip + HLC3 EMA34 early warning + tiered retrace"
+        "status":      "running",
+        "bot":         bot_status,
+        "last_signal": last_signal,
+        "entry_price": entry_price,
+        "peak_profit": peak_profit,
+        "daily_pnl":   daily_pnl,
+        "symbols":     {s: {**cfg, "early_warning_fired": s in early_warning_fired}
+                        for s, cfg in SYMBOL_CONFIG.items()},
+        "interval":    f"{INTERVAL}m",
+        "paused":      bot_paused,
+        "features": {
+            "adx_filter":     ENABLE_ADX_FILTER,
+            "trade_logging":  ENABLE_TRADE_LOGGING,
+            "hard_stop_loss": ENABLE_HARD_STOP_LOSS,
+            "dual_timeframe": ENABLE_DUAL_TIMEFRAME,
+        }
     })
 
 @app.route("/status")
@@ -619,21 +849,21 @@ def status():
                 size = float(pos.get("size", 0))
                 if size > 0:
                     positions[symbol] = {
-                        "side":               pos["side"],
-                        "size":               size,
-                        "entry_price":        pos.get("avgPrice"),
-                        "unrealised_pnl":     pos.get("unrealisedPnl"),
-                        "liq_price":          pos.get("liqPrice"),
-                        "peak_profit":        round(peak_profit.get(symbol, 0), 3),
+                        "side":                pos["side"],
+                        "size":                size,
+                        "entry_price":         pos.get("avgPrice"),
+                        "unrealised_pnl":      pos.get("unrealisedPnl"),
+                        "liq_price":           pos.get("liqPrice"),
+                        "peak_profit":         round(peak_profit.get(symbol, 0), 3),
                         "early_warning_fired": symbol in early_warning_fired,
+                        "paused":              is_symbol_paused(symbol),
                     }
         return jsonify({
-            "open_positions":      positions,
-            "last_signal":         last_signal,
-            "last_scan":           bot_status["last_scan"],
-            "daily_pnl":           daily_pnl,
-            "paused":              bot_paused,
-            "early_warning_fired": list(early_warning_fired)
+            "open_positions": positions,
+            "last_signal":    last_signal,
+            "last_scan":      bot_status["last_scan"],
+            "daily_pnl":      daily_pnl,
+            "paused":         bot_paused,
         })
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -642,15 +872,29 @@ def status():
 def pause():
     global bot_paused
     bot_paused = True
-    print("[PAUSE] Bot paused by user")
-    return jsonify({"message": "Bot paused — no new orders will be placed"})
+    return jsonify({"message": "Bot paused — all symbols stopped"})
 
 @app.route("/resume")
 def resume():
     global bot_paused
     bot_paused = False
-    print("[RESUME] Bot resumed by user")
     return jsonify({"message": "Bot resumed"})
+
+@app.route("/pause/<symbol>")
+def pause_symbol(symbol):
+    sym = symbol.upper()
+    if sym not in SYMBOL_CONFIG:
+        return jsonify({"error": f"{sym} not found"})
+    SYMBOL_CONFIG[sym]["paused"] = True
+    return jsonify({"message": f"{sym} paused"})
+
+@app.route("/resume/<symbol>")
+def resume_symbol(symbol):
+    sym = symbol.upper()
+    if sym not in SYMBOL_CONFIG:
+        return jsonify({"error": f"{sym} not found"})
+    SYMBOL_CONFIG[sym]["paused"] = False
+    return jsonify({"message": f"{sym} resumed"})
 
 @app.route("/sync")
 def sync():
@@ -663,7 +907,6 @@ def sync():
 @app.route("/closeall")
 def closeall():
     try:
-        # close_all_positions acquires per-symbol locks internally — safe from Flask thread
         close_all_positions()
         return jsonify({"message": "All positions closed"})
     except Exception as e:
@@ -696,7 +939,6 @@ def test():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-# NEW route — manually reset early warning for a symbol if needed
 @app.route("/reset_warning/<symbol>")
 def reset_warning(symbol):
     early_warning_fired.discard(symbol.upper())
