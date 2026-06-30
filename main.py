@@ -54,8 +54,8 @@ RETRACE_PCT    = 0.70
 PARTIAL_PCT    = 0.25
 
 # ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
-ENABLE_ADX_FILTER     = True
-ENABLE_TRADE_LOGGING  = True
+ENABLE_ADX_FILTER     = False
+ENABLE_TRADE_LOGGING  = False
 ENABLE_HARD_STOP_LOSS = False
 ENABLE_DUAL_TIMEFRAME = False
 
@@ -66,10 +66,9 @@ DUAL_TF_INTERVAL = "15"
 LOG_FILE         = "/tmp/gkc_trades.csv"
 
 # ─── BOT MODE ─────────────────────────────────────────────────────────────────
-# Three modes — change via /trading, /signalonly, /pause routes
-# "trading"     → full bot — signals + orders + community alerts
-# "signal_only" → no orders placed — signals still post to community
-# "paused"      → nothing — no signals, no orders, no community alerts
+# "trading"     → signals + orders + community alerts
+# "signal_only" → community alerts only — no orders placed
+# "paused"      → completely silent — nothing fires
 BOT_MODE = "trading"
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
@@ -361,6 +360,7 @@ def check_early_signal_alert(symbol, closes):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UPGRADE #1 — ADX FILTER (PAUSED)
+# IMPORTANT: only filters NEW entries — never blocks exits
 # ═══════════════════════════════════════════════════════════════════════════════
 def calc_adx(highs, lows, closes, period=ADX_PERIOD):
     if len(closes) < period * 2:
@@ -400,7 +400,8 @@ def calc_adx(highs, lows, closes, period=ADX_PERIOD):
         print(f"[ADX] Calc error: {e}")
         return 0
 
-def adx_filter_passes(symbol, highs, lows, closes):
+def adx_allows_new_entry(symbol, highs, lows, closes):
+    """Only call this for NEW entries — never for exits"""
     if not ENABLE_ADX_FILTER:
         return True
     adx    = calc_adx(highs, lows, closes)
@@ -408,10 +409,10 @@ def adx_filter_passes(symbol, highs, lows, closes):
     print(f"[ADX] {symbol} ADX={adx} | threshold={ADX_THRESHOLD} | trending={passes}")
     if not passes:
         send_telegram(
-            f"⏸️ <b>SIGNAL SKIPPED — ADX FILTER</b>\n"
+            f"⏸️ <b>NEW ENTRY SKIPPED — ADX</b>\n"
             f"Symbol: {symbol}\n"
             f"ADX: {adx} (below {ADX_THRESHOLD})\n"
-            f"Market ranging — waiting for trend",
+            f"Market ranging — existing position closed, no new entry",
             private=True
         )
     return passes
@@ -481,8 +482,10 @@ def check_hard_stop(symbol):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UPGRADE #4 — DUAL TIMEFRAME (PAUSED)
+# IMPORTANT: only filters NEW entries — never blocks exits
 # ═══════════════════════════════════════════════════════════════════════════════
-def dual_tf_confirms(symbol, signal):
+def dual_tf_allows_new_entry(symbol, signal):
+    """Only call this for NEW entries — never for exits"""
     if not ENABLE_DUAL_TIMEFRAME:
         return True
     try:
@@ -495,10 +498,10 @@ def dual_tf_confirms(symbol, signal):
         print(f"[DUAL TF] {symbol} | 15m {round(fast_15m,4)}/{round(slow_15m,4)} | agrees={agrees}")
         if not agrees:
             send_telegram(
-                f"⏸️ <b>SIGNAL SKIPPED — DUAL TF</b>\n"
+                f"⏸️ <b>NEW ENTRY SKIPPED — DUAL TF</b>\n"
                 f"Symbol: {symbol}\n"
                 f"60m signal: {signal.upper()}\n"
-                f"15m EMA disagrees — waiting for alignment",
+                f"15m EMA disagrees — existing position closed, no new entry",
                 private=True
             )
         return agrees
@@ -614,6 +617,7 @@ def close_position(symbol, reason="signal"):
         peak_profit.pop(symbol, None)
         early_warning_fired.discard(symbol)
         early_signal_alerted.pop(symbol, None)
+        # Always send close alert regardless of mode or filters
         send_telegram(
             f"🔴 <b>POSITION CLOSED</b>\n"
             f"Symbol: {symbol}\n"
@@ -627,7 +631,6 @@ def close_position(symbol, reason="signal"):
 def place_order(symbol, signal):
     try:
         set_leverage(symbol)
-        close_position(symbol, reason="signal flip")
         price = get_price(symbol)
         if not price:
             return
@@ -662,7 +665,6 @@ def place_order(symbol, signal):
         traceback.print_exc()
 
 # ─── SIGNAL ONLY ALERT ────────────────────────────────────────────────────────
-# In signal_only mode — posts to community but does NOT place orders
 def send_signal_only_alert(symbol, signal, price):
     side = "BUY 🟢" if signal == "buy" else "SELL 🔴"
     send_telegram(
@@ -683,12 +685,16 @@ def close_all_positions():
     print("[RISK] All positions closed")
 
 # ─── REAL-TIME MONITOR ────────────────────────────────────────────────────────
+# FIX: retrace and stop loss run in trading mode AND
+# when switching from signal_only back to trading
+# so open positions are always protected
 def realtime_retrace_monitor():
     print("[MONITOR] Real-time monitor started — checking every 45s")
     while True:
         try:
             mode = get_mode()
-            # Retrace/stop monitoring only runs in trading mode
+            # Monitor runs in trading mode only
+            # signal_only has no open positions so nothing to protect
             if mode == "trading" and not daily_pnl["stopped"]:
                 for symbol in list(last_signal.keys()):
                     if is_symbol_paused(symbol):
@@ -754,7 +760,7 @@ def run_bot():
             print(f"[STATUS] PnL=${round(daily_pnl['pnl'],2)} | "
                   f"Trades={daily_pnl['trades']} | Stopped={daily_pnl['stopped']}")
 
-            # ── FULLY PAUSED — do nothing ──
+            # ── FULLY PAUSED ──
             if mode == "paused":
                 print("[PAUSED] Bot fully paused — no signals, no orders")
                 continue
@@ -776,12 +782,11 @@ def run_bot():
                 close_all_positions()
                 continue
 
-            # ── TRADING or SIGNAL_ONLY — sync and scan ──
             sync_state_from_bybit()
 
             for symbol in SYMBOLS:
                 if is_symbol_paused(symbol):
-                    print(f"[PAUSED] {symbol} is paused — skipping")
+                    print(f"[PAUSED] {symbol} — skipping")
                     continue
 
                 lock = symbol_locks.get(symbol)
@@ -789,7 +794,7 @@ def run_bot():
                     continue
 
                 with lock:
-                    # Retrace check only in trading mode
+                    # Retrace backup at candle close — trading mode only
                     if mode == "trading" and symbol in last_signal:
                         if check_peak_retrace(symbol):
                             print(f"[RETRACE] {symbol} — closing at candle")
@@ -797,29 +802,38 @@ def run_bot():
                             last_signal.pop(symbol, None)
                             continue
 
-                    # Signal check runs in both trading and signal_only
                     signal, highs, lows, closes = check_signal(symbol)
                     prev = last_signal.get(symbol)
                     print(f"[SIGNAL] {symbol} | current={signal} | previous={prev} | mode={mode}")
 
                     if signal and signal != prev:
-                        # ADX filter
-                        if highs and not adx_filter_passes(symbol, highs, lows, closes):
-                            print(f"[ADX] {symbol} signal skipped — ranging market")
-                            continue
 
                         if mode == "trading":
-                            # Dual TF filter
-                            if not dual_tf_confirms(symbol, signal):
-                                print(f"[DUAL TF] {symbol} signal skipped")
+                            # ── FIX #1: Always close existing position on flip
+                            # regardless of ADX or dual TF — exits are never filtered
+                            if prev and symbol in entry_price:
+                                print(f"[EXIT] {symbol} closing {prev} on signal flip")
+                                close_position(symbol, reason="signal flip")
+                                last_signal.pop(symbol, None)
+
+                            # ── FIX #2: ADX only gates NEW entries, never exits
+                            if highs and not adx_allows_new_entry(symbol, highs, lows, closes):
+                                print(f"[ADX] {symbol} ranging — position closed, no new entry")
                                 continue
+
+                            # ── FIX #3: Dual TF only gates NEW entries, never exits
+                            if not dual_tf_allows_new_entry(symbol, signal):
+                                print(f"[DUAL TF] {symbol} disagrees — position closed, no new entry")
+                                continue
+
                             print(f"[ORDER] {symbol} {signal.upper()} — placing order")
                             place_order(symbol, signal)
                             last_signal[symbol] = signal
                             bot_status["last_signal"] = last_signal.copy()
 
                         elif mode == "signal_only":
-                            # Alert community but don't trade
+                            # No positions in signal_only so no exit needed
+                            # Just alert community
                             price = get_price(symbol) or 0
                             print(f"[SIGNAL ONLY] {symbol} {signal.upper()} — alerting community")
                             send_signal_only_alert(symbol, signal, price)
@@ -869,13 +883,13 @@ def status():
                 size = float(pos.get("size", 0))
                 if size > 0:
                     positions[symbol] = {
-                        "side":          pos["side"],
-                        "size":          size,
-                        "entry_price":   pos.get("avgPrice"),
+                        "side":           pos["side"],
+                        "size":           size,
+                        "entry_price":    pos.get("avgPrice"),
                         "unrealised_pnl": pos.get("unrealisedPnl"),
-                        "liq_price":     pos.get("liqPrice"),
-                        "peak_profit":   round(peak_profit.get(symbol, 0), 3),
-                        "paused":        is_symbol_paused(symbol),
+                        "liq_price":      pos.get("liqPrice"),
+                        "peak_profit":    round(peak_profit.get(symbol, 0), 3),
+                        "paused":         is_symbol_paused(symbol),
                     }
         return jsonify({
             "mode":           get_mode(),
@@ -887,29 +901,44 @@ def status():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-# ── Mode control routes ──
+# ── FIX #4: switching to signal_only closes all open positions first
+# so they're not left unprotected with no retrace monitoring
+@app.route("/signalonly")
+def mode_signal_only():
+    mode = get_mode()
+    if mode == "trading" and last_signal:
+        print("[MODE] Closing all positions before switching to signal only")
+        close_all_positions()
+        send_telegram(
+            f"📡 <b>SWITCHING TO SIGNAL ONLY</b>\n"
+            f"All open positions closed first\n"
+            f"Community alerts active — no new orders",
+            private=True
+        )
+    else:
+        send_telegram(
+            f"📡 <b>BOT MODE: SIGNAL ONLY</b>\n"
+            f"Community alerts active — no orders being placed",
+            private=True
+        )
+    set_mode("signal_only")
+    print("[MODE] Switched to SIGNAL ONLY")
+    return jsonify({"mode": "signal_only", "message": "Signal only — alerts active, no orders"})
+
 @app.route("/trading")
 def mode_trading():
     set_mode("trading")
     print("[MODE] Switched to TRADING")
     send_telegram("⚡ <b>BOT MODE: TRADING</b>\nSignals + orders active", private=True)
-    return jsonify({"mode": "trading", "message": "Bot now trading — signals and orders active"})
-
-@app.route("/signalonly")
-def mode_signal_only():
-    set_mode("signal_only")
-    print("[MODE] Switched to SIGNAL ONLY")
-    send_telegram("📡 <b>BOT MODE: SIGNAL ONLY</b>\nCommunity alerts active — no orders being placed", private=True)
-    return jsonify({"mode": "signal_only", "message": "Signal only — community alerts active, no orders placed"})
+    return jsonify({"mode": "trading", "message": "Bot now trading"})
 
 @app.route("/pause")
 def mode_pause():
     set_mode("paused")
     print("[MODE] Switched to PAUSED")
     send_telegram("⏸️ <b>BOT MODE: PAUSED</b>\nNo signals, no orders", private=True)
-    return jsonify({"mode": "paused", "message": "Bot fully paused — no signals, no orders"})
+    return jsonify({"mode": "paused", "message": "Bot fully paused"})
 
-# ── Per-symbol pause routes ──
 @app.route("/pause/<symbol>")
 def pause_symbol(symbol):
     sym = symbol.upper()
