@@ -25,11 +25,9 @@ TELEGRAM_PRIVATE_ID = os.environ.get("TELEGRAM_PRIVATE_ID", "5351361684")
 MIN_PROFIT_TO_TRACK = 5.0
 
 # ── PER-SYMBOL CONFIG ─────────────────────────────────────────────────────────
-# paused: True = bot skips this symbol entirely (no new trades, no closes)
-# early_warning: True = enables HLC3/EMA34 partial close for this symbol
 SYMBOL_CONFIG = {
     "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False, "paused": False},
-    "HYPEUSDT": {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
+    "HYPEUSDT": {"trade_usdt": 10, "leverage": 10, "early_warning": False, "paused": False},
     "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
     "ETHUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
 }
@@ -56,24 +54,28 @@ RETRACE_PCT    = 0.70
 PARTIAL_PCT    = 0.25
 
 # ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
-# All upgrades OFF by default — enable one at a time to test independently
-ENABLE_ADX_FILTER     = True  # Skip signals when market is ranging (ADX < threshold)
-ENABLE_TRADE_LOGGING  = True  # Log every trade entry/exit to CSV for analysis
-ENABLE_HARD_STOP_LOSS = False  # Close if loss exceeds STOP_LOSS_PCT from entry
-ENABLE_DUAL_TIMEFRAME = False  # Require 15m EMA to agree with 60m before entering
+ENABLE_ADX_FILTER     = False
+ENABLE_TRADE_LOGGING  = False
+ENABLE_HARD_STOP_LOSS = False
+ENABLE_DUAL_TIMEFRAME = False
 
-# ── Feature settings ──
 ADX_PERIOD       = 14
 ADX_THRESHOLD    = 20
 STOP_LOSS_PCT    = 4.0
 DUAL_TF_INTERVAL = "15"
 LOG_FILE         = "/tmp/gkc_trades.csv"
 
+# ─── BOT MODE ─────────────────────────────────────────────────────────────────
+# Three modes — change via /trading, /signalonly, /pause routes
+# "trading"     → full bot — signals + orders + community alerts
+# "signal_only" → no orders placed — signals still post to community
+# "paused"      → nothing — no signals, no orders, no community alerts
+BOT_MODE = "trading"
+
 # ─── STATE ────────────────────────────────────────────────────────────────────
 last_signal          = {}
 entry_price          = {}
 peak_profit          = {}
-bot_paused           = False
 bot_status           = {"last_scan": "never", "error": None}
 daily_pnl            = {"date": None, "pnl": 0.0, "trades": 0, "stopped": False}
 processed_exec_ids   = set()
@@ -82,6 +84,16 @@ early_signal_alerted = {}
 
 # ─── THREAD SAFETY ────────────────────────────────────────────────────────────
 symbol_locks = {s: threading.Lock() for s in SYMBOL_CONFIG}
+mode_lock    = threading.Lock()
+
+def get_mode():
+    with mode_lock:
+        return BOT_MODE
+
+def set_mode(mode):
+    global BOT_MODE
+    with mode_lock:
+        BOT_MODE = mode
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 def send_telegram(message, private=False):
@@ -314,10 +326,8 @@ def check_early_warning(symbol):
     last_h = hlc3[-1]
     sig    = last_signal[symbol]
     if sig == "buy" and last_h < ema34:
-        print(f"[WARN] {symbol} HLC3 {round(last_h,4)} < EMA34 {round(ema34,4)} — bearish")
         return True
     if sig == "sell" and last_h >= ema34:
-        print(f"[WARN] {symbol} HLC3 {round(last_h,4)} >= EMA34 {round(ema34,4)} — bullish")
         return True
     return False
 
@@ -350,8 +360,7 @@ def check_early_signal_alert(symbol, closes):
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ─── UPGRADE #1 — ADX FILTER (PAUSED) ────────────────────────────────────────
-# Enable: ENABLE_ADX_FILTER = True
+# UPGRADE #1 — ADX FILTER (PAUSED)
 # ═══════════════════════════════════════════════════════════════════════════════
 def calc_adx(highs, lows, closes, period=ADX_PERIOD):
     if len(closes) < period * 2:
@@ -394,8 +403,8 @@ def calc_adx(highs, lows, closes, period=ADX_PERIOD):
 def adx_filter_passes(symbol, highs, lows, closes):
     if not ENABLE_ADX_FILTER:
         return True
-    adx     = calc_adx(highs, lows, closes)
-    passes  = adx >= ADX_THRESHOLD
+    adx    = calc_adx(highs, lows, closes)
+    passes = adx >= ADX_THRESHOLD
     print(f"[ADX] {symbol} ADX={adx} | threshold={ADX_THRESHOLD} | trending={passes}")
     if not passes:
         send_telegram(
@@ -408,8 +417,7 @@ def adx_filter_passes(symbol, highs, lows, closes):
     return passes
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ─── UPGRADE #2 — TRADE LOGGING (PAUSED) ─────────────────────────────────────
-# Enable: ENABLE_TRADE_LOGGING = True
+# UPGRADE #2 — TRADE LOGGING (PAUSED)
 # ═══════════════════════════════════════════════════════════════════════════════
 def init_log():
     if not ENABLE_TRADE_LOGGING:
@@ -439,13 +447,11 @@ def log_trade(symbol, action, side, price, qty=0, peak=0, closed_pnl=0, reason="
                 round(peak, 3), round(closed_pnl, 4),
                 round(daily_pnl["pnl"], 4), reason
             ])
-        print(f"[LOG] {action} logged for {symbol}")
     except Exception as e:
         print(f"[LOG] Write error: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ─── UPGRADE #3 — HARD STOP LOSS (PAUSED) ────────────────────────────────────
-# Enable: ENABLE_HARD_STOP_LOSS = True
+# UPGRADE #3 — HARD STOP LOSS (PAUSED)
 # ═══════════════════════════════════════════════════════════════════════════════
 def check_hard_stop(symbol):
     if not ENABLE_HARD_STOP_LOSS:
@@ -455,8 +461,8 @@ def check_hard_stop(symbol):
     price = get_price(symbol)
     if not price:
         return False
-    ep  = entry_price[symbol]
-    sig = last_signal[symbol]
+    ep       = entry_price[symbol]
+    sig      = last_signal[symbol]
     if ep == 0:
         return False
     loss_pct = (ep - price) / ep * 100 if sig == "buy" else (price - ep) / ep * 100
@@ -474,8 +480,7 @@ def check_hard_stop(symbol):
     return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ─── UPGRADE #4 — DUAL TIMEFRAME (PAUSED) ────────────────────────────────────
-# Enable: ENABLE_DUAL_TIMEFRAME = True
+# UPGRADE #4 — DUAL TIMEFRAME (PAUSED)
 # ═══════════════════════════════════════════════════════════════════════════════
 def dual_tf_confirms(symbol, signal):
     if not ENABLE_DUAL_TIMEFRAME:
@@ -483,13 +488,11 @@ def dual_tf_confirms(symbol, signal):
     try:
         _, _, closes_15m = get_candles(symbol, interval=DUAL_TF_INTERVAL)
         if len(closes_15m) < EMA_SLOW + 5:
-            print(f"[DUAL TF] {symbol} not enough 15m candles — skipping filter")
             return True
         fast_15m = calc_ema(closes_15m, EMA_FAST)
         slow_15m = calc_ema(closes_15m, EMA_SLOW)
         agrees   = fast_15m > slow_15m if signal == "buy" else fast_15m < slow_15m
-        print(f"[DUAL TF] {symbol} | 15m EMA {round(fast_15m,4)}/{round(slow_15m,4)} | "
-              f"signal={signal} | agrees={agrees}")
+        print(f"[DUAL TF] {symbol} | 15m {round(fast_15m,4)}/{round(slow_15m,4)} | agrees={agrees}")
         if not agrees:
             send_telegram(
                 f"⏸️ <b>SIGNAL SKIPPED — DUAL TF</b>\n"
@@ -516,7 +519,6 @@ def partial_close(symbol, pct=PARTIAL_PCT):
                 precision  = get_qty_precision(symbol)
                 close_qty  = round(size * pct, precision)
                 if close_qty <= 0:
-                    print(f"[PARTIAL] {symbol} qty too small, skipping")
                     return
                 close_side = "Sell" if pos["side"] == "Buy" else "Buy"
                 body       = {
@@ -584,8 +586,8 @@ def close_position(symbol, reason="signal"):
     headers = sign_get(params)
     r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
         headers=headers, params=params, timeout=10)
-    closed     = False
-    close_qty  = 0
+    closed         = False
+    close_qty      = 0
     close_side_str = ""
     for pos in r.json().get("result", {}).get("list", []):
         size = float(pos.get("size", 0))
@@ -628,7 +630,6 @@ def place_order(symbol, signal):
         close_position(symbol, reason="signal flip")
         price = get_price(symbol)
         if not price:
-            print(f"[ERROR] Price fetch failed for {symbol}")
             return
         precision = get_qty_precision(symbol)
         qty       = round((get_trade_usdt(symbol) * get_leverage(symbol)) / price, precision)
@@ -660,6 +661,18 @@ def place_order(symbol, signal):
         print(f"[ERROR] Order failed {symbol}: {e}")
         traceback.print_exc()
 
+# ─── SIGNAL ONLY ALERT ────────────────────────────────────────────────────────
+# In signal_only mode — posts to community but does NOT place orders
+def send_signal_only_alert(symbol, signal, price):
+    side = "BUY 🟢" if signal == "buy" else "SELL 🔴"
+    send_telegram(
+        f"📡 <b>SIGNAL ALERT</b>\n"
+        f"Symbol: {symbol}\n"
+        f"Direction: {side}\n"
+        f"Price: ${price}\n"
+        f"⚠️ Monitoring mode — not trading"
+    )
+
 # ─── CLOSE ALL ────────────────────────────────────────────────────────────────
 def close_all_positions():
     for symbol in SYMBOLS:
@@ -674,32 +687,28 @@ def realtime_retrace_monitor():
     print("[MONITOR] Real-time monitor started — checking every 45s")
     while True:
         try:
-            if not bot_paused and not daily_pnl["stopped"]:
+            mode = get_mode()
+            # Retrace/stop monitoring only runs in trading mode
+            if mode == "trading" and not daily_pnl["stopped"]:
                 for symbol in list(last_signal.keys()):
-                    # Skip if this symbol is individually paused
                     if is_symbol_paused(symbol):
                         continue
                     lock = symbol_locks.get(symbol)
                     if not lock:
                         continue
                     if not lock.acquire(blocking=False):
-                        print(f"[MONITOR] {symbol} locked — skipping this cycle")
+                        print(f"[MONITOR] {symbol} locked — skipping")
                         continue
                     try:
-                        # Hard stop loss check
                         if check_hard_stop(symbol):
                             close_position(symbol, reason="hard stop loss")
                             last_signal.pop(symbol, None)
                             continue
-                        # Early warning partial close
                         if is_early_warning_on(symbol) and symbol not in early_warning_fired:
                             if check_early_warning(symbol):
-                                print(f"[EARLY WARNING] {symbol} — closing {int(PARTIAL_PCT*100)}%")
                                 partial_close(symbol, PARTIAL_PCT)
                                 early_warning_fired.add(symbol)
-                        # Peak retrace full close
                         if symbol in last_signal and check_peak_retrace(symbol):
-                            print(f"[REALTIME RETRACE] {symbol} — closing full position")
                             send_telegram(
                                 f"📉 <b>RETRACE EXIT</b>\n"
                                 f"Symbol: {symbol}\n"
@@ -729,6 +738,7 @@ def run_bot():
     print(f"  Trade Logging:   {'ON' if ENABLE_TRADE_LOGGING  else 'OFF'}")
     print(f"  Hard Stop Loss:  {'ON' if ENABLE_HARD_STOP_LOSS else 'OFF'}")
     print(f"  Dual Timeframe:  {'ON' if ENABLE_DUAL_TIMEFRAME else 'OFF'}")
+    print(f"MODE: {BOT_MODE.upper()}")
     print("=" * 60)
     init_log()
     sync_state_from_bybit()
@@ -737,14 +747,16 @@ def run_bot():
             wait_for_candle_close()
             check_daily_reset()
 
-            print(f"\n[SCAN] {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            mode = get_mode()
+            print(f"\n[SCAN] {time.strftime('%Y-%m-%d %H:%M:%S')} UTC | MODE: {mode.upper()}")
             bot_status["last_scan"] = time.strftime('%Y-%m-%d %H:%M:%S UTC')
+            bot_status["mode"]      = mode
             print(f"[STATUS] PnL=${round(daily_pnl['pnl'],2)} | "
-                  f"Trades={daily_pnl['trades']} | "
-                  f"Stopped={daily_pnl['stopped']} | Paused={bot_paused}")
+                  f"Trades={daily_pnl['trades']} | Stopped={daily_pnl['stopped']}")
 
-            if bot_paused:
-                print("[PAUSED] Bot is paused — skipping all signals")
+            # ── FULLY PAUSED — do nothing ──
+            if mode == "paused":
+                print("[PAUSED] Bot fully paused — no signals, no orders")
                 continue
 
             if daily_pnl["stopped"]:
@@ -764,10 +776,10 @@ def run_bot():
                 close_all_positions()
                 continue
 
+            # ── TRADING or SIGNAL_ONLY — sync and scan ──
             sync_state_from_bybit()
 
             for symbol in SYMBOLS:
-                # ── Per-symbol pause check ──
                 if is_symbol_paused(symbol):
                     print(f"[PAUSED] {symbol} is paused — skipping")
                     continue
@@ -777,33 +789,42 @@ def run_bot():
                     continue
 
                 with lock:
-                    # Peak retrace backup at candle close
-                    if symbol in last_signal:
+                    # Retrace check only in trading mode
+                    if mode == "trading" and symbol in last_signal:
                         if check_peak_retrace(symbol):
                             print(f"[RETRACE] {symbol} — closing at candle")
                             close_position(symbol, reason="retrace at candle")
                             last_signal.pop(symbol, None)
                             continue
 
-                    # EMA signal check
+                    # Signal check runs in both trading and signal_only
                     signal, highs, lows, closes = check_signal(symbol)
                     prev = last_signal.get(symbol)
-                    print(f"[SIGNAL] {symbol} | current={signal} | previous={prev}")
+                    print(f"[SIGNAL] {symbol} | current={signal} | previous={prev} | mode={mode}")
 
                     if signal and signal != prev:
                         # ADX filter
-                        if not adx_filter_passes(symbol, highs, lows, closes):
+                        if highs and not adx_filter_passes(symbol, highs, lows, closes):
                             print(f"[ADX] {symbol} signal skipped — ranging market")
                             continue
-                        # Dual timeframe filter
-                        if not dual_tf_confirms(symbol, signal):
-                            print(f"[DUAL TF] {symbol} signal skipped — 15m disagrees")
-                            continue
 
-                        print(f"[ORDER] {symbol} {signal.upper()} confirmed")
-                        place_order(symbol, signal)
-                        last_signal[symbol] = signal
-                        bot_status["last_signal"] = last_signal.copy()
+                        if mode == "trading":
+                            # Dual TF filter
+                            if not dual_tf_confirms(symbol, signal):
+                                print(f"[DUAL TF] {symbol} signal skipped")
+                                continue
+                            print(f"[ORDER] {symbol} {signal.upper()} — placing order")
+                            place_order(symbol, signal)
+                            last_signal[symbol] = signal
+                            bot_status["last_signal"] = last_signal.copy()
+
+                        elif mode == "signal_only":
+                            # Alert community but don't trade
+                            price = get_price(symbol) or 0
+                            print(f"[SIGNAL ONLY] {symbol} {signal.upper()} — alerting community")
+                            send_signal_only_alert(symbol, signal, price)
+                            last_signal[symbol] = signal
+                            bot_status["last_signal"] = last_signal.copy()
                     else:
                         print(f"[HOLD] {symbol} | no confirmed reversal")
 
@@ -818,6 +839,7 @@ def run_bot():
 def index():
     return jsonify({
         "status":      "running",
+        "mode":        get_mode(),
         "bot":         bot_status,
         "last_signal": last_signal,
         "entry_price": entry_price,
@@ -826,7 +848,6 @@ def index():
         "symbols":     {s: {**cfg, "early_warning_fired": s in early_warning_fired}
                         for s, cfg in SYMBOL_CONFIG.items()},
         "interval":    f"{INTERVAL}m",
-        "paused":      bot_paused,
         "features": {
             "adx_filter":     ENABLE_ADX_FILTER,
             "trade_logging":  ENABLE_TRADE_LOGGING,
@@ -848,37 +869,47 @@ def status():
                 size = float(pos.get("size", 0))
                 if size > 0:
                     positions[symbol] = {
-                        "side":                pos["side"],
-                        "size":                size,
-                        "entry_price":         pos.get("avgPrice"),
-                        "unrealised_pnl":      pos.get("unrealisedPnl"),
-                        "liq_price":           pos.get("liqPrice"),
-                        "peak_profit":         round(peak_profit.get(symbol, 0), 3),
-                        "early_warning_fired": symbol in early_warning_fired,
-                        "paused":              is_symbol_paused(symbol),
+                        "side":          pos["side"],
+                        "size":          size,
+                        "entry_price":   pos.get("avgPrice"),
+                        "unrealised_pnl": pos.get("unrealisedPnl"),
+                        "liq_price":     pos.get("liqPrice"),
+                        "peak_profit":   round(peak_profit.get(symbol, 0), 3),
+                        "paused":        is_symbol_paused(symbol),
                     }
         return jsonify({
+            "mode":           get_mode(),
             "open_positions": positions,
             "last_signal":    last_signal,
             "last_scan":      bot_status["last_scan"],
             "daily_pnl":      daily_pnl,
-            "paused":         bot_paused,
         })
     except Exception as e:
         return jsonify({"error": str(e)})
 
+# ── Mode control routes ──
+@app.route("/trading")
+def mode_trading():
+    set_mode("trading")
+    print("[MODE] Switched to TRADING")
+    send_telegram("⚡ <b>BOT MODE: TRADING</b>\nSignals + orders active", private=True)
+    return jsonify({"mode": "trading", "message": "Bot now trading — signals and orders active"})
+
+@app.route("/signalonly")
+def mode_signal_only():
+    set_mode("signal_only")
+    print("[MODE] Switched to SIGNAL ONLY")
+    send_telegram("📡 <b>BOT MODE: SIGNAL ONLY</b>\nCommunity alerts active — no orders being placed", private=True)
+    return jsonify({"mode": "signal_only", "message": "Signal only — community alerts active, no orders placed"})
+
 @app.route("/pause")
-def pause():
-    global bot_paused
-    bot_paused = True
-    return jsonify({"message": "Bot paused — all symbols stopped"})
+def mode_pause():
+    set_mode("paused")
+    print("[MODE] Switched to PAUSED")
+    send_telegram("⏸️ <b>BOT MODE: PAUSED</b>\nNo signals, no orders", private=True)
+    return jsonify({"mode": "paused", "message": "Bot fully paused — no signals, no orders"})
 
-@app.route("/resume")
-def resume():
-    global bot_paused
-    bot_paused = False
-    return jsonify({"message": "Bot resumed"})
-
+# ── Per-symbol pause routes ──
 @app.route("/pause/<symbol>")
 def pause_symbol(symbol):
     sym = symbol.upper()
@@ -933,7 +964,8 @@ def test():
         }, timeout=10)
         return jsonify({
             "btc_price":    r.json()["result"]["list"][0]["lastPrice"],
-            "api_keys_set": bool(API_KEY and API_SECRET)
+            "api_keys_set": bool(API_KEY and API_SECRET),
+            "mode":         get_mode()
         })
     except Exception as e:
         return jsonify({"error": str(e)})
