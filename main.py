@@ -54,7 +54,7 @@ RETRACE_PCT    = 0.70
 PARTIAL_PCT    = 0.25
 
 # ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
-ENABLE_ADX_FILTER     = True
+ENABLE_ADX_FILTER     = False
 ENABLE_TRADE_LOGGING  = True
 ENABLE_HARD_STOP_LOSS = False
 ENABLE_DUAL_TIMEFRAME = False
@@ -672,7 +672,7 @@ def send_signal_only_alert(symbol, signal, price):
         f"Symbol: {symbol}\n"
         f"Direction: {side}\n"
         f"Price: ${price}\n"
-        f"⚠️ Monitoring mode — not trading"
+        
     )
 
 # ─── CLOSE ALL ────────────────────────────────────────────────────────────────
