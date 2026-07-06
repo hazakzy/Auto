@@ -56,8 +56,8 @@ PARTIAL_PCT    = 0.25
 # ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
 ENABLE_ADX_FILTER     = False
 ENABLE_TRADE_LOGGING  = True
-ENABLE_HARD_STOP_LOSS = False
-ENABLE_DUAL_TIMEFRAME = False
+ENABLE_HARD_STOP_LOSS = True
+ENABLE_DUAL_TIMEFRAME = True
 
 ADX_PERIOD       = 14
 ADX_THRESHOLD    = 20
