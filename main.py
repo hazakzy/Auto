@@ -54,10 +54,10 @@ RETRACE_PCT    = 0.70
 PARTIAL_PCT    = 0.25
 
 # ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
-ENABLE_ADX_FILTER     = False
+ENABLE_ADX_FILTER     = True
 ENABLE_TRADE_LOGGING  = True
 ENABLE_HARD_STOP_LOSS = True
-ENABLE_DUAL_TIMEFRAME = True
+ENABLE_DUAL_TIMEFRAME = False
 
 ADX_PERIOD       = 14
 ADX_THRESHOLD    = 20
