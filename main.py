@@ -26,7 +26,7 @@ MIN_PROFIT_TO_TRACK = 5.0
 
 # ── PER-SYMBOL CONFIG ─────────────────────────────────────────────────────────
 SYMBOL_CONFIG = {
-    "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": True, "paused": False},
+    "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False, "paused": False},
     "HYPEUSDT": {"trade_usdt": 10, "leverage": 10, "early_warning": False, "paused": False},
     "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
     "ETHUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
@@ -55,20 +55,23 @@ PARTIAL_PCT    = 0.25
 
 # ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
 # All upgrades OFF by default — enable one at a time to test independently
-ENABLE_VOLATILITY_FILTER = False  # Replaces ADX — skips entries when price not moving enough
-ENABLE_TRADE_LOGGING     = False  # Log every trade entry/exit to CSV for analysis
-ENABLE_HARD_STOP_LOSS    = False  # Close if loss exceeds STOP_LOSS_PCT from entry
-ENABLE_DUAL_TIMEFRAME    = False  # Require 15m EMA to agree with 60m before entering
+ENABLE_VOLATILITY_FILTER = False  # Skip entries when price not moving enough
+ENABLE_TRADE_LOGGING     = False  # Log every trade entry/exit to CSV
+ENABLE_HARD_STOP_LOSS    = False  # Close if leveraged loss exceeds STOP_LOSS_PCT
+ENABLE_DUAL_TIMEFRAME    = False  # Require 15m EMA to agree with 60m
+ENABLE_LSMA_FILTER       = False  # Only trade in direction of LSMA400 macro trend
+                                   # Translated from Triple LSMA (© hazaq)
+                                   # Most powerful filter — beats ADX for crypto
 
-# ADX is kept in code for reference but removed from all logic
-# Confirmed: ADX is too slow for crypto 60m — misses explosive early moves
-# ENABLE_ADX_FILTER = False  ← retired, replaced by volatility filter
+# ADX retired — too slow for crypto 60m, replaced by volatility filter
+# ENABLE_ADX_FILTER = False
 
 # ── Feature settings ──
-VOLATILITY_CANDLES   = 5     # number of candles to measure price range
-VOLATILITY_MIN_PCT   = 0.8   # skip entry if price range < 0.8% over last 5 candles
-STOP_LOSS_PCT        = 40  # leveraged loss % — 15% = 1.5% price move on 10x
+VOLATILITY_CANDLES   = 5      # candles to measure price range
+VOLATILITY_MIN_PCT   = 0.8    # skip if range < 0.8% over last N candles
+STOP_LOSS_PCT        = 40.0   # leveraged loss % — 40% = 4% price move on 10x
 DUAL_TF_INTERVAL     = "15"
+LSMA_PERIOD          = 400    # macro trend period — same as Triple LSMA strategy
 LOG_FILE             = "/tmp/gkc_trades.csv"
 
 # ─── BOT MODE ─────────────────────────────────────────────────────────────────
@@ -159,7 +162,7 @@ def get_candles(symbol, interval=None):
                 "category": "linear",
                 "symbol":   symbol,
                 "interval": tf,
-                "limit":    150
+                "limit":    500
             }, timeout=10)
             candles = r.json()["result"]["list"]
             candles.reverse()
@@ -496,7 +499,58 @@ def dual_tf_allows_new_entry(symbol, signal):
         print(f"[DUAL TF] Error {symbol}: {e}")
         return True
 
-# ─── PARTIAL CLOSE ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# UPGRADE #5 — LSMA400 MACRO FILTER (PAUSED)
+# Translated from Triple LSMA strategy (© hazaq / Hazak Onchain)
+# Only trade in the direction of the macro trend — if price is above LSMA400
+# only take longs, below LSMA400 only take shorts.
+# This is the most powerful filter for crypto — beats ADX significantly
+# because it measures actual trend direction not just strength.
+# Enable: ENABLE_LSMA_FILTER = True
+# Needs 400+ candles — ensure limit=500 is sufficient in get_candles
+# ═══════════════════════════════════════════════════════════════════════════════
+def calc_lsma(closes, period=LSMA_PERIOD):
+    """Linear Regression Moving Average — same as ta.linreg in Pine Script"""
+    if len(closes) < period:
+        return closes[-1]
+    y     = closes[-period:]
+    n     = period
+    x_sum = n * (n - 1) / 2
+    x2_sum = n * (n - 1) * (2 * n - 1) / 6
+    xy_sum = sum(i * y[i] for i in range(n))
+    y_sum  = sum(y)
+    slope  = (n * xy_sum - x_sum * y_sum) / (n * x2_sum - x_sum ** 2)
+    intercept = (y_sum - slope * x_sum) / n
+    return intercept + slope * (n - 1)
+
+def lsma_macro_confirms(symbol, closes, signal):
+    """Only trade in direction of LSMA400 macro trend — entry filter only"""
+    if not ENABLE_LSMA_FILTER:
+        return True
+    if len(closes) < LSMA_PERIOD:
+        print(f"[LSMA] {symbol} not enough candles ({len(closes)}) — skipping filter")
+        return True
+    lsma400    = calc_lsma(closes, LSMA_PERIOD)
+    price      = closes[-1]
+    above      = price > lsma400
+    buy_ok     = signal == "buy"  and above   # only long when above LSMA400
+    sell_ok    = signal == "sell" and not above  # only short when below LSMA400
+    confirms   = buy_ok or sell_ok
+    print(f"[LSMA] {symbol} | price={round(price,4)} | "
+          f"LSMA400={round(lsma400,4)} | "
+          f"above={above} | signal={signal} | confirms={confirms}")
+    if not confirms:
+        send_telegram(
+            f"⏸️ <b>NEW ENTRY SKIPPED — LSMA MACRO</b>\n"
+            f"Symbol: {symbol}\n"
+            f"Signal: {signal.upper()}\n"
+            f"Price: ${round(price, 4)}\n"
+            f"LSMA400: ${round(lsma400, 4)}\n"
+            f"{'Price below LSMA400 — no longs' if signal == 'buy' else 'Price above LSMA400 — no shorts'}\n"
+            f"Existing position closed, no new entry",
+            private=True
+        )
+    return confirms
 def partial_close(symbol, pct=PARTIAL_PCT):
     try:
         params  = {"category": "linear", "symbol": symbol}
@@ -727,10 +781,11 @@ def run_bot():
         status = "PAUSED" if cfg.get("paused") else f"${cfg['trade_usdt']} x {cfg['leverage']}x"
         print(f"  {s}: {status}")
     print("FEATURE FLAGS:")
-    print(f"  ADX Filter:      {'ON' if ENABLE_ADX_FILTER     else 'OFF'}")
-    print(f"  Trade Logging:   {'ON' if ENABLE_TRADE_LOGGING  else 'OFF'}")
-    print(f"  Hard Stop Loss:  {'ON' if ENABLE_HARD_STOP_LOSS else 'OFF'}")
-    print(f"  Dual Timeframe:  {'ON' if ENABLE_DUAL_TIMEFRAME else 'OFF'}")
+    print(f"  Volatility Filter: {'ON' if ENABLE_VOLATILITY_FILTER else 'OFF'}")
+    print(f"  Trade Logging:     {'ON' if ENABLE_TRADE_LOGGING     else 'OFF'}")
+    print(f"  Hard Stop Loss:    {'ON' if ENABLE_HARD_STOP_LOSS    else 'OFF'}")
+    print(f"  Dual Timeframe:    {'ON' if ENABLE_DUAL_TIMEFRAME    else 'OFF'}")
+    print(f"  LSMA400 Filter:    {'ON' if ENABLE_LSMA_FILTER       else 'OFF'}")
     print(f"MODE: {BOT_MODE.upper()}")
     print("=" * 60)
     init_log()
@@ -803,14 +858,19 @@ def run_bot():
                                 close_position(symbol, reason="signal flip")
                                 last_signal.pop(symbol, None)
 
-                            # ── FIX #2: ADX only gates NEW entries, never exits
-                            if highs and not adx_allows_new_entry(symbol, highs, lows, closes):
-                                print(f"[ADX] {symbol} ranging — position closed, no new entry")
+                            # ── Volatility filter — entry only ──
+                            if highs and not volatility_allows_new_entry(symbol, closes):
+                                print(f"[VOLATILITY] {symbol} too flat — position closed, no new entry")
                                 continue
 
-                            # ── FIX #3: Dual TF only gates NEW entries, never exits
+                            # ── Dual TF filter — entry only ──
                             if not dual_tf_allows_new_entry(symbol, signal):
                                 print(f"[DUAL TF] {symbol} disagrees — position closed, no new entry")
+                                continue
+
+                            # ── LSMA400 macro filter — entry only ──
+                            if not lsma_macro_confirms(symbol, closes, signal):
+                                print(f"[LSMA] {symbol} macro disagrees — position closed, no new entry")
                                 continue
 
                             print(f"[ORDER] {symbol} {signal.upper()} — placing order")
@@ -850,10 +910,12 @@ def index():
                         for s, cfg in SYMBOL_CONFIG.items()},
         "interval":    f"{INTERVAL}m",
         "features": {
-            "adx_filter":     ENABLE_ADX_FILTER,
-            "trade_logging":  ENABLE_TRADE_LOGGING,
-            "hard_stop_loss": ENABLE_HARD_STOP_LOSS,
-            "dual_timeframe": ENABLE_DUAL_TIMEFRAME,
+            "volatility_filter": ENABLE_VOLATILITY_FILTER,
+            "trade_logging":     ENABLE_TRADE_LOGGING,
+            "hard_stop_loss":    ENABLE_HARD_STOP_LOSS,
+            "dual_timeframe":    ENABLE_DUAL_TIMEFRAME,
+            "lsma_filter":       ENABLE_LSMA_FILTER,
+        }
         }
     })
 
