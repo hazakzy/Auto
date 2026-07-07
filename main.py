@@ -26,8 +26,8 @@ MIN_PROFIT_TO_TRACK = 5.0
 
 # ── PER-SYMBOL CONFIG ─────────────────────────────────────────────────────────
 SYMBOL_CONFIG = {
-    "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False, "paused": False},
-    "HYPEUSDT": {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
+    "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": True, "paused": False},
+    "HYPEUSDT": {"trade_usdt": 10, "leverage": 10, "early_warning": False, "paused": False},
     "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
     "ETHUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
 }
@@ -54,16 +54,22 @@ RETRACE_PCT    = 0.70
 PARTIAL_PCT    = 0.25
 
 # ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
-ENABLE_ADX_FILTER     = True
-ENABLE_TRADE_LOGGING  = True
-ENABLE_HARD_STOP_LOSS = True
-ENABLE_DUAL_TIMEFRAME = False
+# All upgrades OFF by default — enable one at a time to test independently
+ENABLE_VOLATILITY_FILTER = False  # Replaces ADX — skips entries when price not moving enough
+ENABLE_TRADE_LOGGING     = False  # Log every trade entry/exit to CSV for analysis
+ENABLE_HARD_STOP_LOSS    = False  # Close if loss exceeds STOP_LOSS_PCT from entry
+ENABLE_DUAL_TIMEFRAME    = False  # Require 15m EMA to agree with 60m before entering
 
-ADX_PERIOD       = 14
-ADX_THRESHOLD    = 20
-STOP_LOSS_PCT    = 4.0
-DUAL_TF_INTERVAL = "15"
-LOG_FILE         = "/tmp/gkc_trades.csv"
+# ADX is kept in code for reference but removed from all logic
+# Confirmed: ADX is too slow for crypto 60m — misses explosive early moves
+# ENABLE_ADX_FILTER = False  ← retired, replaced by volatility filter
+
+# ── Feature settings ──
+VOLATILITY_CANDLES   = 5     # number of candles to measure price range
+VOLATILITY_MIN_PCT   = 0.8   # skip entry if price range < 0.8% over last 5 candles
+STOP_LOSS_PCT        = 40  # leveraged loss % — 15% = 1.5% price move on 10x
+DUAL_TF_INTERVAL     = "15"
+LOG_FILE             = "/tmp/gkc_trades.csv"
 
 # ─── BOT MODE ─────────────────────────────────────────────────────────────────
 # "trading"     → signals + orders + community alerts
@@ -359,63 +365,41 @@ def check_early_signal_alert(symbol, closes):
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UPGRADE #1 — ADX FILTER (PAUSED)
-# IMPORTANT: only filters NEW entries — never blocks exits
+# UPGRADE #1 — VOLATILITY FILTER (PAUSED)
+# Replaces ADX — ADX was confirmed too slow for crypto 60m timeframe
+# This checks if price actually moved enough over recent candles
+# If price is dead flat, skip the entry — the EMA cross is likely noise
+# Enable: ENABLE_VOLATILITY_FILTER = True
 # ═══════════════════════════════════════════════════════════════════════════════
-def calc_adx(highs, lows, closes, period=ADX_PERIOD):
-    if len(closes) < period * 2:
-        return 0
-    try:
-        tr_list, pdm_list, ndm_list = [], [], []
-        for i in range(1, len(closes)):
-            high, low, prev_close = highs[i], lows[i], closes[i-1]
-            tr  = max(high - low, abs(high - prev_close), abs(low - prev_close))
-            pdm = max(highs[i] - highs[i-1], 0) if (highs[i] - highs[i-1]) > (lows[i-1] - lows[i]) else 0
-            ndm = max(lows[i-1] - lows[i], 0) if (lows[i-1] - lows[i]) > (highs[i] - highs[i-1]) else 0
-            tr_list.append(tr)
-            pdm_list.append(pdm)
-            ndm_list.append(ndm)
-        def wilder_smooth(data, p):
-            s = sum(data[:p])
-            result = [s]
-            for v in data[p:]:
-                s = s - s / p + v
-                result.append(s)
-            return result
-        atr  = wilder_smooth(tr_list,  period)
-        pDM  = wilder_smooth(pdm_list, period)
-        nDM  = wilder_smooth(ndm_list, period)
-        dx_list = []
-        for i in range(len(atr)):
-            if atr[i] == 0:
-                continue
-            pDI = 100 * pDM[i] / atr[i]
-            nDI = 100 * nDM[i] / atr[i]
-            dx  = 100 * abs(pDI - nDI) / (pDI + nDI) if (pDI + nDI) != 0 else 0
-            dx_list.append(dx)
-        if not dx_list:
-            return 0
-        return round(sum(dx_list[-period:]) / period, 2)
-    except Exception as e:
-        print(f"[ADX] Calc error: {e}")
-        return 0
-
-def adx_allows_new_entry(symbol, highs, lows, closes):
-    """Only call this for NEW entries — never for exits"""
-    if not ENABLE_ADX_FILTER:
+def volatility_allows_new_entry(symbol, closes):
+    """Returns True if price moved enough to justify a new entry"""
+    if not ENABLE_VOLATILITY_FILTER:
         return True
-    adx    = calc_adx(highs, lows, closes)
-    passes = adx >= ADX_THRESHOLD
-    print(f"[ADX] {symbol} ADX={adx} | threshold={ADX_THRESHOLD} | trending={passes}")
+    if len(closes) < VOLATILITY_CANDLES:
+        return True
+    recent    = closes[-VOLATILITY_CANDLES:]
+    range_pct = (max(recent) - min(recent)) / min(recent) * 100
+    passes    = range_pct >= VOLATILITY_MIN_PCT
+    print(f"[VOLATILITY] {symbol} range={round(range_pct,3)}% | "
+          f"min={VOLATILITY_MIN_PCT}% | passes={passes}")
     if not passes:
         send_telegram(
-            f"⏸️ <b>NEW ENTRY SKIPPED — ADX</b>\n"
+            f"⏸️ <b>NEW ENTRY SKIPPED — LOW VOLATILITY</b>\n"
             f"Symbol: {symbol}\n"
-            f"ADX: {adx} (below {ADX_THRESHOLD})\n"
-            f"Market ranging — existing position closed, no new entry",
+            f"Price range last {VOLATILITY_CANDLES} candles: {round(range_pct,3)}%\n"
+            f"Minimum required: {VOLATILITY_MIN_PCT}%\n"
+            f"Market too flat — waiting for movement",
             private=True
         )
     return passes
+
+# ── ADX functions kept for reference — removed from all active logic ──────────
+# ADX was tested live and confirmed unsuitable for crypto 60m:
+# - Too slow to detect trend starts — misses explosive early moves
+# - Crypto often starts trends FROM low ADX conditions
+# - Volatility filter is a better fit for this asset class
+# def calc_adx(...): ...
+# def adx_allows_new_entry(...): ...
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UPGRADE #2 — TRADE LOGGING (PAUSED)
@@ -466,15 +450,18 @@ def check_hard_stop(symbol):
     sig      = last_signal[symbol]
     if ep == 0:
         return False
-    loss_pct = (ep - price) / ep * 100 if sig == "buy" else (price - ep) / ep * 100
+    lev      = get_leverage(symbol)
+    loss_pct = ((ep - price) / ep * 100 * lev) if sig == "buy" else ((price - ep) / ep * 100 * lev)
     if loss_pct >= STOP_LOSS_PCT:
         print(f"[STOP] {symbol} hard stop hit — loss={round(loss_pct,3)}%")
+        raw_loss = round(loss_pct / lev, 2)
         send_telegram(
             f"🛑 <b>HARD STOP LOSS</b>\n"
             f"Symbol: {symbol}\n"
             f"Entry: ${ep} | Current: ${price}\n"
-            f"Loss: {round(loss_pct, 2)}%\n"
-            f"Closing position now",
+            f"Price move: -{raw_loss}%\n"
+            f"Leveraged loss ({lev}x): -{round(loss_pct, 2)}%\n"
+            f"Closing now",
             private=True
         )
         return True
@@ -672,7 +659,7 @@ def send_signal_only_alert(symbol, signal, price):
         f"Symbol: {symbol}\n"
         f"Direction: {side}\n"
         f"Price: ${price}\n"
-        
+        f"⚠️ Monitoring mode — not trading"
     )
 
 # ─── CLOSE ALL ────────────────────────────────────────────────────────────────
