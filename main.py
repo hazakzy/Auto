@@ -1,7 +1,13 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║           GKC BOT — VERSION 2.1                                 ║
+# ║           GKC BOT — VERSION 2.2                                 ║
 # ║           Built by Hazak | Hazak Onchain | @cryptoedgelab       ║
 # ║           Base strategy by GK                                   ║
+# ║                                                                  ║
+# ║  V2.2 Production Upgrades:                                      ║
+# ║  ✅ Persistent JSON state (survives restarts)                   ║
+# ║  ✅ Async Telegram queue (never blocks trading)                 ║
+# ║  ✅ Safe request wrapper (retry + exponential backoff)          ║
+# ║  ✅ Health watchdog (detects + restarts dead threads)           ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 import os
@@ -10,6 +16,7 @@ import hmac
 import hashlib
 import time
 import csv
+import queue
 import requests
 import threading
 import traceback
@@ -29,6 +36,7 @@ TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "@cryptoedgelab")
 TELEGRAM_PRIVATE_ID = os.environ.get("TELEGRAM_PRIVATE_ID", "5351361684")
 
 MIN_PROFIT_TO_TRACK = 5.0
+STATE_FILE          = "/tmp/gkc_state.json"  # persistent state file
 
 # ── PER-SYMBOL CONFIG ─────────────────────────────────────────────────────────
 SYMBOL_CONFIG = {
@@ -51,107 +59,74 @@ def is_early_warning_on(symbol):
 def is_symbol_paused(symbol):
     return SYMBOL_CONFIG.get(symbol, {}).get("paused", False)
 
-INTERVAL       = "60"
-EMA_FAST       = 12
-EMA_SLOW       = 21
-EMA_WARN       = 34
+INTERVAL  = "60"
+EMA_FAST  = 12
+EMA_SLOW  = 21
+EMA_WARN  = 34
 MAX_DAILY_LOSS = 25
 PARTIAL_PCT    = 0.25
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  VERSION 2.1 — FEATURE FLAGS                                    ║
-# ║  All OFF by default — enable one at a time to test              ║
+# ║  FEATURE FLAGS — All OFF by default                             ║
+# ║  Enable one at a time to test                                   ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-# ── V1 upgrades (carried forward) ──
-ENABLE_TRADE_LOGGING     = False  # Log all trades to CSV
-ENABLE_HARD_STOP_LOSS    = True   # Close on leveraged loss threshold
-ENABLE_DUAL_TIMEFRAME    = False  # 15m + 60m EMA agreement
-ENABLE_LSMA_FILTER       = False  # Only trade with LSMA400 macro trend
-ENABLE_VOLATILITY_FILTER = False  # Legacy percentage range filter (replaced by ATR)
+# ── V1 flags ──
+ENABLE_TRADE_LOGGING     = False
+ENABLE_HARD_STOP_LOSS    = True    # fixed in V2.2 — measures leveraged loss
+ENABLE_DUAL_TIMEFRAME    = False
+ENABLE_LSMA_FILTER       = False
+ENABLE_VOLATILITY_FILTER = False
 
-# ── V2.1 upgrades ──
-ENABLE_ATR_FILTER          = True  # ★★★★★ ATR-based volatility — replaces range filter
-ENABLE_CONSECUTIVE_LOSS    = True  # ★★★★★ Auto-pause symbol after N losing trades
-ENABLE_DYNAMIC_SIZING      = False  # ★★★★★ Adjust position size based on ATR volatility
-ENABLE_MARKET_REGIME       = False  # ★★★★★ Detect trending vs ranging before entering
-ENABLE_PROFIT_LOCKING      = True  # ★★★★★ Lock profit levels (breakeven → 5% → 12%)
-ENABLE_VOLUME_FILTER       = False  # ★★★★☆ Require volume > EMA20 volume on crossover
-ENABLE_TIME_FILTER         = False  # ★★★★☆ Avoid low-quality trading hours
+# ── V2.1 flags ──
+ENABLE_ATR_FILTER        = False
+ENABLE_CONSECUTIVE_LOSS  = False
+ENABLE_DYNAMIC_SIZING    = False
+ENABLE_MARKET_REGIME     = False
+ENABLE_PROFIT_LOCKING    = False
+ENABLE_VOLUME_FILTER     = False
+ENABLE_TIME_FILTER       = False
 
 # ── Feature settings ──
-# Hard stop loss
-STOP_LOSS_PCT           = 40.0   # leveraged loss % — 40% = 4% price move on 10x
-
-# ATR filter
-ATR_PERIOD              = 14     # standard ATR period
-ATR_MIN_PCT             = 0.5    # skip entry if ATR < 0.5% of price (too quiet)
-
-# Consecutive loss protection
-MAX_CONSECUTIVE_LOSSES  = 3      # auto-pause symbol after 3 losses in a row
-COOLDOWN_CANDLES        = 2      # wait 2 candles before re-enabling after cooldown
-
-# Dynamic sizing tiers (ATR % of price)
-DYNAMIC_SIZE_HIGH_VOL   = 0.5    # above this → half position
-DYNAMIC_SIZE_MED_VOL    = 0.25   # above this → 75% position
-# below both → full position
-
-# Market regime
-REGIME_LSMA_PERIOD      = 50     # LSMA period for slope calculation
-REGIME_SLOPE_MIN        = 0.05   # minimum LSMA slope to confirm trend
-REGIME_EMA_DIST_MIN     = 0.15   # minimum EMA 12/21 distance % to confirm trend
-
-# Profit locking levels (peak_profit_pct, lock_at_pct)
-PROFIT_LOCK_LEVELS      = [
-    (8.0,  0.0),    # at 8% peak → move stop to breakeven
-    (15.0, 5.0),    # at 15% peak → lock in 5% minimum profit
-    (25.0, 12.0),   # at 25% peak → lock in 12% minimum profit
-]
-
-# Volume filter
-VOLUME_EMA_PERIOD       = 20     # EMA period for volume baseline
-
-# Time filter (UTC hours to avoid)
-TIME_AVOID_HOURS        = [0, 1] # avoid 00:00–02:00 UTC (low liquidity)
-TIME_AVOID_WEEKENDS     = False  # set True to skip Saturday/Sunday
-
-# Dual timeframe
-DUAL_TF_INTERVAL        = "15"
-
-# LSMA macro
-LSMA_PERIOD             = 400
-
-# Trade log
-LOG_FILE                = "/tmp/gkc_trades.csv"
+STOP_LOSS_PCT          = 40.0   # leveraged % — 40% = 4% price move on 10x
+ATR_PERIOD             = 14
+ATR_MIN_PCT            = 0.5
+MAX_CONSECUTIVE_LOSSES = 3
+COOLDOWN_CANDLES       = 2
+DYNAMIC_SIZE_HIGH_VOL  = 0.5
+DYNAMIC_SIZE_MED_VOL   = 0.25
+REGIME_LSMA_PERIOD     = 50
+REGIME_SLOPE_MIN       = 0.05
+REGIME_EMA_DIST_MIN    = 0.15
+PROFIT_LOCK_LEVELS     = [(8.0, 0.0), (15.0, 5.0), (25.0, 12.0)]
+VOLUME_EMA_PERIOD      = 20
+TIME_AVOID_HOURS       = [0, 1]
+TIME_AVOID_WEEKENDS    = False
+DUAL_TF_INTERVAL       = "15"
+LSMA_PERIOD            = 400
+LOG_FILE               = "/tmp/gkc_trades.csv"
 
 # ─── BOT MODE ─────────────────────────────────────────────────────────────────
-BOT_MODE = "trading"  # "trading" | "signal_only" | "paused"
+BOT_MODE = "trading"
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
 last_signal          = {}
 entry_price          = {}
 peak_profit          = {}
-locked_profit        = {}    # V2.1 — minimum profit % locked per symbol
-bot_status           = {"last_scan": "never", "error": None, "version": "2.1"}
+locked_profit        = {}
+bot_status           = {"last_scan": "never", "error": None, "version": "2.2"}
 daily_pnl            = {"date": None, "pnl": 0.0, "trades": 0, "stopped": False}
 processed_exec_ids   = set()
 early_warning_fired  = set()
 early_signal_alerted = {}
-
-# V2.1 — per-symbol consecutive loss tracking
 consecutive_losses   = {s: 0 for s in SYMBOL_CONFIG}
 cooldown_candles     = {s: 0 for s in SYMBOL_CONFIG}
-
-# V2.1 — performance tracking per symbol
-performance = {
+performance          = {
     s: {
         "trades": 0, "wins": 0, "losses": 0,
-        "total_pnl": 0.0,
-        "avg_win": 0.0, "avg_loss": 0.0,
+        "total_pnl": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
         "largest_win": 0.0, "largest_loss": 0.0,
-        "win_rate": 0.0,
-        "consecutive_losses": 0,
-        "on_cooldown": False,
+        "win_rate": 0.0, "consecutive_losses": 0,
     }
     for s in SYMBOL_CONFIG
 }
@@ -159,6 +134,7 @@ performance = {
 # ─── THREAD SAFETY ────────────────────────────────────────────────────────────
 symbol_locks = {s: threading.Lock() for s in SYMBOL_CONFIG}
 mode_lock    = threading.Lock()
+state_lock   = threading.Lock()
 
 def get_mode():
     with mode_lock:
@@ -169,30 +145,117 @@ def set_mode(mode):
     with mode_lock:
         BOT_MODE = mode
 
-# ─── TELEGRAM ─────────────────────────────────────────────────────────────────
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  V2.2 UPGRADE #1 — ASYNC TELEGRAM QUEUE                        ║
+# ║  Telegram never blocks trading — messages go into a queue       ║
+# ║  A separate thread sends them in order                          ║
+# ╚══════════════════════════════════════════════════════════════════╝
+telegram_queue = queue.Queue()
+
+def telegram_worker():
+    """Background thread — drains the Telegram queue and sends messages"""
+    print("[TELEGRAM] Queue worker started")
+    while True:
+        try:
+            item = telegram_queue.get(timeout=5)
+            if item is None:
+                continue
+            message, private, attempt = item
+            if not TELEGRAM_TOKEN:
+                telegram_queue.task_done()
+                continue
+            chat_id = TELEGRAM_PRIVATE_ID if private else TELEGRAM_CHAT_ID
+            url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            data    = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+            try:
+                r = requests.post(url, json=data, timeout=10)
+                if r.status_code == 429:
+                    # Rate limited — requeue with delay
+                    retry_after = r.json().get("parameters", {}).get("retry_after", 5)
+                    print(f"[TELEGRAM] Rate limited — retrying after {retry_after}s")
+                    time.sleep(retry_after)
+                    if attempt < 3:
+                        telegram_queue.put((message, private, attempt + 1))
+                elif r.status_code != 200:
+                    print(f"[TELEGRAM] Failed ({r.status_code}): {r.text[:100]}")
+            except Exception as e:
+                print(f"[TELEGRAM] Send error: {e}")
+                if attempt < 3:
+                    time.sleep(2 ** attempt)
+                    telegram_queue.put((message, private, attempt + 1))
+            telegram_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"[TELEGRAM] Worker error: {e}")
+
 def send_telegram(message, private=False):
-    if not TELEGRAM_TOKEN:
-        return
-    try:
-        chat_id = TELEGRAM_PRIVATE_ID if private else TELEGRAM_CHAT_ID
-        url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data    = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-        r       = requests.post(url, json=data, timeout=10)
-        if r.status_code != 200:
-            print(f"[TELEGRAM] Failed: {r.text}")
-    except Exception as e:
-        print(f"[TELEGRAM] Error: {e}")
+    """Non-blocking — puts message in queue, returns immediately"""
+    telegram_queue.put((message, private, 0))
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  V2.2 UPGRADE #2 — SAFE REQUEST WRAPPER                        ║
+# ║  One function for all Bybit API calls                           ║
+# ║  Retry + exponential backoff + rate limit handling              ║
+# ╚══════════════════════════════════════════════════════════════════╝
+def safe_request(method, url, headers=None, params=None, json_body=None,
+                 max_retries=3, timeout=10):
+    """
+    Unified API request with exponential backoff.
+    Returns response JSON or None on failure.
+    """
+    for attempt in range(max_retries):
+        try:
+            if method == "GET":
+                r = requests.get(url, headers=headers, params=params, timeout=timeout)
+            else:
+                r = requests.post(url, headers=headers, json=json_body, timeout=timeout)
+
+            if r.status_code == 429:
+                wait = 2 ** (attempt + 1)
+                print(f"[API] Rate limited — waiting {wait}s (attempt {attempt+1})")
+                time.sleep(wait)
+                continue
+
+            if r.status_code >= 500:
+                wait = 2 ** attempt
+                print(f"[API] Server error {r.status_code} — waiting {wait}s")
+                time.sleep(wait)
+                continue
+
+            return r.json()
+
+        except requests.exceptions.Timeout:
+            wait = 2 ** attempt
+            print(f"[API] Timeout (attempt {attempt+1}/{max_retries}) — waiting {wait}s")
+            time.sleep(wait)
+        except requests.exceptions.ConnectionError as e:
+            wait = 2 ** attempt
+            print(f"[API] Connection error (attempt {attempt+1}): {e} — waiting {wait}s")
+            time.sleep(wait)
+        except Exception as e:
+            print(f"[API] Unexpected error: {e}")
+            time.sleep(2)
+
+    print(f"[API] All {max_retries} attempts failed for {url}")
+    return None
 
 # ─── SIGNATURE ────────────────────────────────────────────────────────────────
-def sign(params):
+def _build_signature(param_str):
+    return hmac.new(
+        API_SECRET.encode(),
+        param_str.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+def sign_post(params):
     timestamp   = str(int(time.time() * 1000))
     recv_window = "5000"
     param_str   = timestamp + API_KEY + recv_window + json.dumps(params)
-    sig = hmac.new(API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
     return {
         "X-BAPI-API-KEY":     API_KEY,
         "X-BAPI-TIMESTAMP":   timestamp,
-        "X-BAPI-SIGN":        sig,
+        "X-BAPI-SIGN":        _build_signature(param_str),
         "X-BAPI-RECV-WINDOW": recv_window,
         "Content-Type":       "application/json"
     }
@@ -202,14 +265,155 @@ def sign_get(params):
     recv_window = "5000"
     query_str   = "&".join(f"{k}={v}" for k, v in params.items())
     param_str   = timestamp + API_KEY + recv_window + query_str
-    sig = hmac.new(API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
     return {
         "X-BAPI-API-KEY":     API_KEY,
         "X-BAPI-TIMESTAMP":   timestamp,
-        "X-BAPI-SIGN":        sig,
+        "X-BAPI-SIGN":        _build_signature(param_str),
         "X-BAPI-RECV-WINDOW": recv_window,
         "Content-Type":       "application/json"
     }
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  V2.2 UPGRADE #3 — PERSISTENT JSON STATE                       ║
+# ║  Saves state every 60s — survives Railway restarts              ║
+# ║  Restores peak_profit, locked_profit, entry_price,             ║
+# ║  consecutive_losses, cooldown_candles                           ║
+# ╚══════════════════════════════════════════════════════════════════╝
+def save_state():
+    """Save critical bot state to JSON file"""
+    with state_lock:
+        try:
+            state = {
+                "last_signal":        last_signal,
+                "entry_price":        entry_price,
+                "peak_profit":        peak_profit,
+                "locked_profit":      locked_profit,
+                "daily_pnl":          daily_pnl,
+                "consecutive_losses": consecutive_losses,
+                "cooldown_candles":   cooldown_candles,
+                "performance":        performance,
+                "bot_mode":           get_mode(),
+                "saved_at":           datetime.now(timezone.utc).isoformat(),
+            }
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, STATE_FILE)  # atomic write — no corrupt files
+        except Exception as e:
+            print(f"[STATE] Save error: {e}")
+
+def load_state():
+    """Load state from JSON file on startup"""
+    global last_signal, entry_price, peak_profit, locked_profit
+    global daily_pnl, consecutive_losses, cooldown_candles, performance
+    global BOT_MODE
+
+    if not os.path.exists(STATE_FILE):
+        print("[STATE] No saved state found — starting fresh")
+        return
+
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+
+        saved_at = state.get("saved_at", "unknown")
+        print(f"[STATE] Loading saved state from {saved_at}")
+
+        last_signal        = state.get("last_signal", {})
+        entry_price        = state.get("entry_price", {})
+        peak_profit        = state.get("peak_profit", {})
+        locked_profit      = state.get("locked_profit", {})
+        consecutive_losses.update(state.get("consecutive_losses", {}))
+        cooldown_candles.update(state.get("cooldown_candles", {}))
+        performance.update(state.get("performance", {}))
+
+        # Only restore daily PnL if it's from today
+        saved_pnl = state.get("daily_pnl", {})
+        today     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if saved_pnl.get("date") == today:
+            daily_pnl.update(saved_pnl)
+            print(f"[STATE] Restored today's PnL: ${daily_pnl['pnl']}")
+        else:
+            print("[STATE] Saved PnL is from previous day — resetting")
+
+        # Restore mode
+        saved_mode = state.get("bot_mode", "trading")
+        set_mode(saved_mode)
+        print(f"[STATE] Restored mode: {saved_mode}")
+        print(f"[STATE] Restored positions: {last_signal}")
+
+    except Exception as e:
+        print(f"[STATE] Load error: {e} — starting fresh")
+
+def state_persistence_worker():
+    """Background thread — saves state every 60 seconds"""
+    print("[STATE] Persistence worker started — saving every 60s")
+    while True:
+        time.sleep(60)
+        save_state()
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  V2.2 UPGRADE #4 — HEALTH WATCHDOG                             ║
+# ║  Monitors bot and retrace threads every 60s                     ║
+# ║  Restarts dead threads + sends private alert                    ║
+# ╚══════════════════════════════════════════════════════════════════╝
+thread_registry   = {}
+thread_last_alive = {}
+
+def register_thread(name, fn, daemon=True):
+    """Create, register and start a thread"""
+    t = threading.Thread(target=fn, daemon=daemon, name=name)
+    t.start()
+    thread_registry[name] = {"fn": fn, "thread": t, "daemon": daemon}
+    thread_last_alive[name] = time.time()
+    return t
+
+def heartbeat(name):
+    """Call this inside long-running thread loops to signal health"""
+    thread_last_alive[name] = time.time()
+
+def watchdog():
+    """Monitors all registered threads — restarts any that die"""
+    print("[WATCHDOG] Started — monitoring threads every 60s")
+    time.sleep(30)  # give threads time to start
+    while True:
+        try:
+            for name, info in list(thread_registry.items()):
+                t = info["thread"]
+                if not t.is_alive():
+                    print(f"[WATCHDOG] ⚠️  Thread '{name}' is dead — restarting")
+                    send_telegram(
+                        f"⚠️ <b>WATCHDOG ALERT</b>\n"
+                        f"Thread '{name}' stopped unexpectedly\n"
+                        f"Restarting automatically now",
+                        private=True
+                    )
+                    new_t = threading.Thread(
+                        target=info["fn"],
+                        daemon=info["daemon"],
+                        name=name
+                    )
+                    new_t.start()
+                    thread_registry[name]["thread"] = new_t
+                    thread_last_alive[name] = time.time()
+                    print(f"[WATCHDOG] ✅ Thread '{name}' restarted")
+                else:
+                    # Check for stale threads (no heartbeat in 10 mins)
+                    last = thread_last_alive.get(name, time.time())
+                    stale_mins = (time.time() - last) / 60
+                    if stale_mins > 10:
+                        print(f"[WATCHDOG] ⚠️  Thread '{name}' stale "
+                              f"({round(stale_mins,1)} mins no heartbeat)")
+                        send_telegram(
+                            f"⚠️ <b>WATCHDOG — STALE THREAD</b>\n"
+                            f"Thread '{name}' has not responded in "
+                            f"{round(stale_mins,1)} minutes\n"
+                            f"Monitor closely",
+                            private=True
+                        )
+        except Exception as e:
+            print(f"[WATCHDOG] Error: {e}")
+        time.sleep(60)
 
 # ─── CORE CALCULATIONS ────────────────────────────────────────────────────────
 def calc_ema(prices, period):
@@ -220,7 +424,6 @@ def calc_ema(prices, period):
     return ema
 
 def calc_atr(highs, lows, closes, period=ATR_PERIOD):
-    """Wilder's Average True Range"""
     if len(closes) < period + 1:
         return 0
     trs = []
@@ -237,7 +440,6 @@ def calc_atr(highs, lows, closes, period=ATR_PERIOD):
     return atr
 
 def calc_lsma(closes, period):
-    """Linear Regression Moving Average — same as ta.linreg in Pine Script"""
     if len(closes) < period:
         return closes[-1]
     y      = closes[-period:]
@@ -246,58 +448,79 @@ def calc_lsma(closes, period):
     x2_sum = n * (n - 1) * (2 * n - 1) / 6
     xy_sum = sum(i * y[i] for i in range(n))
     y_sum  = sum(y)
-    slope  = (n * xy_sum - x_sum * y_sum) / (n * x2_sum - x_sum ** 2)
+    denom  = n * x2_sum - x_sum ** 2
+    if denom == 0:
+        return closes[-1]
+    slope     = (n * xy_sum - x_sum * y_sum) / denom
     intercept = (y_sum - slope * x_sum) / n
     return intercept + slope * (n - 1)
 
-# ─── MARKET DATA ──────────────────────────────────────────────────────────────
+# ─── MARKET DATA (uses safe_request) ─────────────────────────────────────────
+# V2.2: single safe_request call per fetch — no more scattered retry loops
+
+# Per-scan cache — reset every candle
+_candle_cache = {}
+_price_cache  = {}
+
+def clear_scan_cache():
+    """Call at start of each candle scan to reset cache"""
+    _candle_cache.clear()
+    _price_cache.clear()
+
 def get_candles(symbol, interval=None):
-    """Returns (highs, lows, closes, volumes)"""
-    tf = interval or INTERVAL
-    for attempt in range(3):
-        try:
-            r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/kline", params={
-                "category": "linear",
-                "symbol":   symbol,
-                "interval": tf,
-                "limit":    500
-            }, timeout=10)
-            candles = r.json()["result"]["list"]
-            candles.reverse()
-            highs   = [float(c[2]) for c in candles]
-            lows    = [float(c[3]) for c in candles]
-            closes  = [float(c[4]) for c in candles]
-            volumes = [float(c[5]) for c in candles]
-            return highs, lows, closes, volumes
-        except Exception as e:
-            print(f"[ERROR] Candle fetch failed ({attempt+1}/3): {e}")
-            time.sleep(2)
-    return [], [], [], []
+    """Returns (highs, lows, closes, volumes) — cached per scan"""
+    tf  = interval or INTERVAL
+    key = f"{symbol}_{tf}"
+    if key in _candle_cache:
+        return _candle_cache[key]
+    result = safe_request("GET", f"{BASE_URL_PUBLIC}/v5/market/kline", params={
+        "category": "linear", "symbol": symbol, "interval": tf, "limit": 500
+    })
+    if not result:
+        return [], [], [], []
+    try:
+        candles = result["result"]["list"]
+        candles.reverse()
+        data = (
+            [float(c[2]) for c in candles],
+            [float(c[3]) for c in candles],
+            [float(c[4]) for c in candles],
+            [float(c[5]) for c in candles],
+        )
+        _candle_cache[key] = data
+        return data
+    except Exception as e:
+        print(f"[ERROR] Candle parse failed: {e}")
+        return [], [], [], []
 
 def get_price(symbol):
-    for attempt in range(3):
-        try:
-            r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/tickers", params={
-                "category": "linear", "symbol": symbol
-            }, timeout=10)
-            return float(r.json()["result"]["list"][0]["lastPrice"])
-        except Exception as e:
-            print(f"[ERROR] Price fetch failed ({attempt+1}/3): {e}")
-            time.sleep(2)
-    return None
+    """Returns current price — cached per scan"""
+    if symbol in _price_cache:
+        return _price_cache[symbol]
+    result = safe_request("GET", f"{BASE_URL_PUBLIC}/v5/market/tickers", params={
+        "category": "linear", "symbol": symbol
+    })
+    if not result:
+        return None
+    try:
+        price = float(result["result"]["list"][0]["lastPrice"])
+        _price_cache[symbol] = price
+        return price
+    except Exception as e:
+        print(f"[ERROR] Price parse failed: {e}")
+        return None
 
 def get_qty_precision(symbol):
-    for attempt in range(3):
-        try:
-            r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/instruments-info", params={
-                "category": "linear", "symbol": symbol
-            }, timeout=10)
-            step = r.json()["result"]["list"][0]["lotSizeFilter"]["qtyStep"]
-            return len(step.rstrip("0").split(".")[-1]) if "." in step else 0
-        except Exception as e:
-            print(f"[ERROR] Precision fetch failed ({attempt+1}/3): {e}")
-            time.sleep(2)
-    return 3
+    result = safe_request("GET", f"{BASE_URL_PUBLIC}/v5/market/instruments-info", params={
+        "category": "linear", "symbol": symbol
+    })
+    if not result:
+        return 3
+    try:
+        step = result["result"]["list"][0]["lotSizeFilter"]["qtyStep"]
+        return len(step.rstrip("0").split(".")[-1]) if "." in step else 0
+    except:
+        return 3
 
 # ─── TIMING ───────────────────────────────────────────────────────────────────
 def wait_for_candle_close():
@@ -305,7 +528,7 @@ def wait_for_candle_close():
     now          = time.time()
     seconds_left = interval_seconds - (now % interval_seconds)
     sleep_time   = seconds_left + 2
-    print(f"[WAIT] Sleeping {round(sleep_time/60, 2)} mins")
+    print(f"[WAIT] Sleeping {round(sleep_time/60, 2)} mins until next candle")
     time.sleep(sleep_time)
 
 def check_daily_reset():
@@ -317,41 +540,38 @@ def check_daily_reset():
         daily_pnl["stopped"] = False
         processed_exec_ids.clear()
         early_signal_alerted.clear()
-        # Reset cooldowns daily
         for s in SYMBOLS:
-            cooldown_candles[s] = 0
+            cooldown_candles[s]   = 0
             consecutive_losses[s] = 0
             if SYMBOL_CONFIG[s].get("paused_by_loss"):
                 SYMBOL_CONFIG[s]["paused_by_loss"] = False
-                SYMBOL_CONFIG[s]["paused"] = False
-                print(f"[RESET] {s} cooldown lifted — new day")
+                SYMBOL_CONFIG[s]["paused"]         = False
         print(f"[RESET] Daily reset for {today}")
+        save_state()
 
 def update_daily_pnl(symbol):
-    try:
-        params  = {"category": "linear", "symbol": symbol, "limit": "20"}
-        headers = sign_get(params)
-        r = requests.get(f"{BASE_URL_PRIVATE}/v5/execution/list",
-            headers=headers, params=params, timeout=10)
-        trades = r.json().get("result", {}).get("list", [])
-        today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        for trade in trades:
-            trade_time = datetime.fromtimestamp(
-                int(trade["execTime"]) / 1000, tz=timezone.utc
-            ).strftime("%Y-%m-%d")
-            if trade_time != today:
-                continue
-            exec_id = trade.get("execId")
-            if exec_id in processed_exec_ids:
-                continue
-            processed_exec_ids.add(exec_id)
-            pnl = float(trade.get("closedPnl", 0))
-            if pnl != 0:
-                daily_pnl["pnl"]    += pnl
-                daily_pnl["trades"] += 1
-        print(f"[PNL] ${round(daily_pnl['pnl'],2)} | Trades: {daily_pnl['trades']}")
-    except Exception as e:
-        print(f"[ERROR] PnL update failed: {e}")
+    params  = {"category": "linear", "symbol": symbol, "limit": "20"}
+    result  = safe_request("GET", f"{BASE_URL_PRIVATE}/v5/execution/list",
+                           headers=sign_get(params), params=params)
+    if not result:
+        return
+    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    trades = result.get("result", {}).get("list", [])
+    for trade in trades:
+        trade_time = datetime.fromtimestamp(
+            int(trade["execTime"]) / 1000, tz=timezone.utc
+        ).strftime("%Y-%m-%d")
+        if trade_time != today:
+            continue
+        exec_id = trade.get("execId")
+        if exec_id in processed_exec_ids:
+            continue
+        processed_exec_ids.add(exec_id)
+        pnl = float(trade.get("closedPnl", 0))
+        if pnl != 0:
+            daily_pnl["pnl"]    += pnl
+            daily_pnl["trades"] += 1
+    print(f"[PNL] ${round(daily_pnl['pnl'],2)} | Trades: {daily_pnl['trades']}")
 
 # ─── SYNC ─────────────────────────────────────────────────────────────────────
 def sync_state_from_bybit():
@@ -359,62 +579,58 @@ def sync_state_from_bybit():
     for symbol in SYMBOLS:
         lock = symbol_locks.get(symbol)
         with lock:
-            try:
-                params  = {"category": "linear", "symbol": symbol}
-                headers = sign_get(params)
-                r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
-                    headers=headers, params=params, timeout=10)
-                positions = r.json().get("result", {}).get("list", [])
-                found     = False
-                for pos in positions:
-                    size = float(pos.get("size", 0))
-                    if size > 0:
-                        side = pos.get("side")
-                        sig  = "buy" if side == "Buy" else "sell"
-                        last_signal[symbol] = sig
-                        if symbol not in entry_price:
-                            entry_price[symbol] = float(pos.get("avgPrice", 0))
-                            peak_profit[symbol] = 0.0
-                            locked_profit[symbol] = 0.0
-                            print(f"[SYNC] Restored entry: {entry_price[symbol]}")
-                        print(f"[SYNC] {symbol} → {side} size={size} "
-                              f"entry={pos.get('avgPrice')} pnl={pos.get('unrealisedPnl')}")
-                        found = True
-                if not found:
-                    last_signal.pop(symbol, None)
-                    entry_price.pop(symbol, None)
-                    peak_profit.pop(symbol, None)
-                    locked_profit.pop(symbol, None)
-                    early_warning_fired.discard(symbol)
-                    print(f"[SYNC] {symbol} → no open position")
-            except Exception as e:
-                print(f"[ERROR] Sync failed {symbol}: {e}")
-                traceback.print_exc()
+            params  = {"category": "linear", "symbol": symbol}
+            result  = safe_request("GET", f"{BASE_URL_PRIVATE}/v5/position/list",
+                                   headers=sign_get(params), params=params)
+            if not result:
+                continue
+            positions = result.get("result", {}).get("list", [])
+            found     = False
+            for pos in positions:
+                size = float(pos.get("size", 0))
+                if size > 0:
+                    side = pos.get("side")
+                    sig  = "buy" if side == "Buy" else "sell"
+                    last_signal[symbol] = sig
+                    if symbol not in entry_price:
+                        entry_price[symbol]  = float(pos.get("avgPrice", 0))
+                        peak_profit[symbol]  = 0.0
+                        locked_profit[symbol] = 0.0
+                        print(f"[SYNC] Restored entry: {entry_price[symbol]}")
+                    print(f"[SYNC] {symbol} → {side} size={size} "
+                          f"entry={pos.get('avgPrice')} pnl={pos.get('unrealisedPnl')}")
+                    found = True
+            if not found:
+                last_signal.pop(symbol, None)
+                entry_price.pop(symbol, None)
+                peak_profit.pop(symbol, None)
+                locked_profit.pop(symbol, None)
+                early_warning_fired.discard(symbol)
+                print(f"[SYNC] {symbol} → no open position")
     print(f"[SYNC] State: {last_signal}")
 
-# ─── PERFORMANCE TRACKING ─────────────────────────────────────────────────────
+# ─── PERFORMANCE ──────────────────────────────────────────────────────────────
 def record_trade_result(symbol, pnl):
-    """V2.1 — update per-symbol performance stats after every close"""
     p = performance[symbol]
     p["trades"] += 1
     p["total_pnl"] = round(p["total_pnl"] + pnl, 4)
     if pnl > 0:
         p["wins"] += 1
         p["largest_win"] = round(max(p["largest_win"], pnl), 4)
-        total_win = p["avg_win"] * (p["wins"] - 1) + pnl
-        p["avg_win"] = round(total_win / p["wins"], 4)
+        p["avg_win"] = round(
+            (p["avg_win"] * (p["wins"] - 1) + pnl) / p["wins"], 4)
         consecutive_losses[symbol] = 0
         p["consecutive_losses"] = 0
     else:
         p["losses"] += 1
         p["largest_loss"] = round(min(p["largest_loss"], pnl), 4)
-        total_loss = p["avg_loss"] * (p["losses"] - 1) + pnl
-        p["avg_loss"] = round(total_loss / p["losses"], 4)
+        p["avg_loss"] = round(
+            (p["avg_loss"] * (p["losses"] - 1) + pnl) / p["losses"], 4)
         consecutive_losses[symbol] += 1
         p["consecutive_losses"] = consecutive_losses[symbol]
     p["win_rate"] = round(p["wins"] / p["trades"] * 100, 1) if p["trades"] > 0 else 0
 
-# ─── TIERED RETRACE ───────────────────────────────────────────────────────────
+# ─── RETRACE ──────────────────────────────────────────────────────────────────
 def get_retrace_threshold(peak):
     if peak >= 20:   return 0.35
     elif peak >= 10: return 0.50
@@ -435,238 +651,189 @@ def check_peak_retrace(symbol):
     if current_pct > peak_profit.get(symbol, 0):
         peak_profit[symbol] = current_pct
         print(f"[PEAK] {symbol} new peak: {round(current_pct, 3)}%")
-
-        # V2.1 — update profit lock when new peak hit
         if ENABLE_PROFIT_LOCKING:
             update_profit_lock(symbol, current_pct)
-
     peak = peak_profit.get(symbol, 0)
     if peak < MIN_PROFIT_TO_TRACK:
         return False
-
-    # V2.1 — check locked profit floor first
     lock_floor = locked_profit.get(symbol, 0)
     if lock_floor > 0 and current_pct <= lock_floor:
-        print(f"[LOCK] {symbol} dropped below locked profit {lock_floor}% — closing")
+        print(f"[LOCK] {symbol} dropped below locked floor {lock_floor}%")
         return True
-
     threshold         = get_retrace_threshold(peak)
     retrace_triggered = current_pct <= peak * (1 - threshold)
     print(f"[RETRACE] {symbol} | entry={ep} price={price} | "
           f"current={round(current_pct,3)}% | peak={round(peak,3)}% | "
-          f"lock_floor={lock_floor}% | triggered={retrace_triggered}")
+          f"lock={lock_floor}% | triggered={retrace_triggered}")
     return retrace_triggered
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# V2.1 UPGRADE #1 — ATR VOLATILITY FILTER
-# More professional than percentage range — accounts for gaps
-# Enable: ENABLE_ATR_FILTER = True
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── V2.1 FILTERS ─────────────────────────────────────────────────────────────
 def atr_filter_passes(symbol, highs, lows, closes):
-    """Skip entry if ATR is too low — market not moving enough"""
     if not ENABLE_ATR_FILTER:
         return True
     atr     = calc_atr(highs, lows, closes)
     atr_pct = (atr / closes[-1]) * 100
     passes  = atr_pct >= ATR_MIN_PCT
-    print(f"[ATR] {symbol} ATR={round(atr,4)} ({round(atr_pct,3)}%) | "
-          f"min={ATR_MIN_PCT}% | passes={passes}")
+    print(f"[ATR] {symbol} {round(atr_pct,3)}% | min={ATR_MIN_PCT}% | ok={passes}")
     if not passes:
-        send_telegram(
-            f"⏸️ <b>ENTRY SKIPPED — LOW ATR</b>\n"
-            f"Symbol: {symbol}\n"
-            f"ATR: {round(atr_pct, 3)}% (min {ATR_MIN_PCT}%)\n"
-            f"Market too quiet — waiting for volatility",
-            private=True
-        )
+        send_telegram(f"⏸️ <b>SKIPPED — LOW ATR</b>\n{symbol}: {round(atr_pct,3)}%", private=True)
     return passes
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# V2.1 UPGRADE #2 — CONSECUTIVE LOSS PROTECTION
-# Auto-pause symbol after N losing trades — resume next candle after cooldown
-# Enable: ENABLE_CONSECUTIVE_LOSS = True
-# ═══════════════════════════════════════════════════════════════════════════════
 def check_consecutive_loss_limit(symbol):
-    """Returns True if symbol should be skipped due to consecutive losses"""
     if not ENABLE_CONSECUTIVE_LOSS:
         return False
-
-    # Count down cooldown
     if cooldown_candles.get(symbol, 0) > 0:
         cooldown_candles[symbol] -= 1
         remaining = cooldown_candles[symbol]
-        print(f"[COOLDOWN] {symbol} — {remaining} candles remaining")
         if remaining == 0:
             SYMBOL_CONFIG[symbol]["paused_by_loss"] = False
-            print(f"[COOLDOWN] {symbol} cooldown ended — resuming")
-            send_telegram(
-                f"✅ <b>SYMBOL RESUMED</b>\n"
-                f"Symbol: {symbol}\n"
-                f"Cooldown complete — trading resumed",
-                private=True
-            )
-        return True  # still in cooldown this candle
-
-    # Check if we've hit the limit
+            send_telegram(f"✅ <b>{symbol} RESUMED</b>\nCooldown complete", private=True)
+        return True
     losses = consecutive_losses.get(symbol, 0)
     if losses >= MAX_CONSECUTIVE_LOSSES:
-        cooldown_candles[symbol] = COOLDOWN_CANDLES
+        cooldown_candles[symbol]          = COOLDOWN_CANDLES
         SYMBOL_CONFIG[symbol]["paused_by_loss"] = True
-        consecutive_losses[symbol] = 0
-        print(f"[COOLDOWN] {symbol} — {MAX_CONSECUTIVE_LOSSES} consecutive losses — "
-              f"cooling down for {COOLDOWN_CANDLES} candles")
+        consecutive_losses[symbol]        = 0
         send_telegram(
-            f"⏸️ <b>SYMBOL ON COOLDOWN</b>\n"
-            f"Symbol: {symbol}\n"
-            f"Reason: {MAX_CONSECUTIVE_LOSSES} consecutive losing trades\n"
-            f"Cooling down for {COOLDOWN_CANDLES} candles\n"
-            f"Will resume automatically",
+            f"⏸️ <b>{symbol} COOLDOWN</b>\n"
+            f"{MAX_CONSECUTIVE_LOSSES} consecutive losses\n"
+            f"Pausing {COOLDOWN_CANDLES} candles",
             private=True
         )
         return True
-
     return False
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# V2.1 UPGRADE #3 — DYNAMIC POSITION SIZING
-# Smaller size in high volatility, larger in low volatility
-# Enable: ENABLE_DYNAMIC_SIZING = True
-# ═══════════════════════════════════════════════════════════════════════════════
 def get_dynamic_trade_usdt(symbol, highs, lows, closes):
-    """Adjust position size based on current ATR volatility"""
     base = get_trade_usdt(symbol)
     if not ENABLE_DYNAMIC_SIZING:
         return base
     atr     = calc_atr(highs, lows, closes)
     atr_pct = (atr / closes[-1]) * 100
     if atr_pct > DYNAMIC_SIZE_HIGH_VOL:
-        size = round(base * 0.5, 2)
-        tier = "HIGH VOL"
+        size, tier = round(base * 0.5, 2),  "HIGH VOL"
     elif atr_pct > DYNAMIC_SIZE_MED_VOL:
-        size = round(base * 0.75, 2)
-        tier = "MED VOL"
+        size, tier = round(base * 0.75, 2), "MED VOL"
     else:
-        size = base
-        tier = "LOW VOL"
-    print(f"[DYNAMIC SIZE] {symbol} ATR={round(atr_pct,3)}% | "
-          f"{tier} | size=${size} (base=${base})")
+        size, tier = base, "LOW VOL"
+    print(f"[SIZING] {symbol} ATR={round(atr_pct,3)}% → {tier} ${size}")
     return size
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# V2.1 UPGRADE #4 — MARKET REGIME DETECTION
-# LSMA slope + EMA distance — no ADX needed
-# Enable: ENABLE_MARKET_REGIME = True
-# ═══════════════════════════════════════════════════════════════════════════════
 def market_is_trending(symbol, highs, lows, closes):
-    """Returns True if market is trending — safe to trade"""
     if not ENABLE_MARKET_REGIME:
         return True
     if len(closes) < REGIME_LSMA_PERIOD + 10:
         return True
-
-    # LSMA slope — is the trend actually going somewhere?
     lsma_now  = calc_lsma(closes, REGIME_LSMA_PERIOD)
     lsma_prev = calc_lsma(closes[:-5], REGIME_LSMA_PERIOD)
     slope     = abs(lsma_now - lsma_prev) / closes[-1] * 100
-
-    # EMA distance — are fast and slow EMAs separated enough?
-    fast     = calc_ema(closes, EMA_FAST)
-    slow     = calc_ema(closes, EMA_SLOW)
-    ema_dist = abs(fast - slow) / slow * 100
-
-    trending = slope >= REGIME_SLOPE_MIN and ema_dist >= REGIME_EMA_DIST_MIN
-    print(f"[REGIME] {symbol} | slope={round(slope,4)}% | "
-          f"ema_dist={round(ema_dist,4)}% | trending={trending}")
-
+    fast      = calc_ema(closes, EMA_FAST)
+    slow      = calc_ema(closes, EMA_SLOW)
+    ema_dist  = abs(fast - slow) / slow * 100
+    trending  = slope >= REGIME_SLOPE_MIN and ema_dist >= REGIME_EMA_DIST_MIN
+    print(f"[REGIME] {symbol} slope={round(slope,4)}% ema_dist={round(ema_dist,4)}% trending={trending}")
     if not trending:
-        send_telegram(
-            f"⏸️ <b>ENTRY SKIPPED — RANGING MARKET</b>\n"
-            f"Symbol: {symbol}\n"
-            f"LSMA slope: {round(slope,4)}% (min {REGIME_SLOPE_MIN}%)\n"
-            f"EMA distance: {round(ema_dist,4)}% (min {REGIME_EMA_DIST_MIN}%)\n"
-            f"Market ranging — no entry",
-            private=True
-        )
+        send_telegram(f"⏸️ <b>SKIPPED — RANGING</b>\n{symbol}", private=True)
     return trending
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# V2.1 UPGRADE #5 — PROFIT LOCKING
-# Move stop to breakeven at +8%, lock profit at +15% and +25%
-# Enable: ENABLE_PROFIT_LOCKING = True
-# ═══════════════════════════════════════════════════════════════════════════════
-def update_profit_lock(symbol, current_peak):
-    """Update the minimum locked profit floor as trade moves in our favour"""
-    if not ENABLE_PROFIT_LOCKING:
-        return
+def update_profit_lock(symbol, peak):
     current_lock = locked_profit.get(symbol, 0)
     for peak_threshold, lock_at in sorted(PROFIT_LOCK_LEVELS, reverse=True):
-        if current_peak >= peak_threshold and lock_at > current_lock:
+        if peak >= peak_threshold and lock_at > current_lock:
             locked_profit[symbol] = lock_at
             label = "BREAKEVEN" if lock_at == 0 else f"+{lock_at}%"
-            print(f"[LOCK] {symbol} peak={round(current_peak,2)}% — "
-                  f"locking profit floor at {label}")
+            print(f"[LOCK] {symbol} peak={round(peak,2)}% → floor {label}")
             send_telegram(
-                f"🔒 <b>PROFIT LOCKED</b>\n"
-                f"Symbol: {symbol}\n"
-                f"Peak profit: {round(current_peak,2)}%\n"
-                f"Floor set at: {label}\n"
-                f"Position won't close below this level",
+                f"🔒 <b>PROFIT LOCKED — {symbol}</b>\n"
+                f"Peak: {round(peak,2)}% | Floor: {label}",
                 private=True
             )
+            save_state()
             break
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# V2.1 UPGRADE #6 — VOLUME CONFIRMATION
-# Only trade when volume is above its EMA — weak crosses ignored
-# Enable: ENABLE_VOLUME_FILTER = True
-# ═══════════════════════════════════════════════════════════════════════════════
 def volume_confirms(symbol, volumes):
-    """Returns True if current volume is above volume EMA — strong move"""
-    if not ENABLE_VOLUME_FILTER:
+    if not ENABLE_VOLUME_FILTER or len(volumes) < VOLUME_EMA_PERIOD:
         return True
-    if len(volumes) < VOLUME_EMA_PERIOD:
-        return True
-    vol_ema     = calc_ema(volumes, VOLUME_EMA_PERIOD)
-    current_vol = volumes[-1]
-    passes      = current_vol > vol_ema
-    print(f"[VOLUME] {symbol} vol={round(current_vol,2)} | "
-          f"ema={round(vol_ema,2)} | confirms={passes}")
+    vol_ema = calc_ema(volumes, VOLUME_EMA_PERIOD)
+    passes  = volumes[-1] > vol_ema
     if not passes:
-        send_telegram(
-            f"⏸️ <b>ENTRY SKIPPED — LOW VOLUME</b>\n"
-            f"Symbol: {symbol}\n"
-            f"Volume: {round(current_vol,2)}\n"
-            f"Volume EMA: {round(vol_ema,2)}\n"
-            f"Weak crossover — no entry",
-            private=True
-        )
+        send_telegram(f"⏸️ <b>SKIPPED — LOW VOLUME</b>\n{symbol}", private=True)
     return passes
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# V2.1 UPGRADE #7 — TIME FILTER
-# Avoid low-quality trading hours and optionally weekends
-# Enable: ENABLE_TIME_FILTER = True
-# ═══════════════════════════════════════════════════════════════════════════════
 def time_allows_entry(symbol):
-    """Returns True if current time is suitable for trading"""
     if not ENABLE_TIME_FILTER:
         return True
     now = datetime.now(timezone.utc)
     if now.hour in TIME_AVOID_HOURS:
-        print(f"[TIME] {symbol} — blocked hour {now.hour}:00 UTC")
-        send_telegram(
-            f"⏸️ <b>ENTRY SKIPPED — TIME FILTER</b>\n"
-            f"Symbol: {symbol}\n"
-            f"Hour: {now.hour}:00 UTC (low liquidity window)",
-            private=True
-        )
+        print(f"[TIME] {symbol} blocked — hour {now.hour}:00 UTC")
         return False
     if TIME_AVOID_WEEKENDS and now.weekday() >= 5:
-        print(f"[TIME] {symbol} — weekend trading disabled")
+        print(f"[TIME] {symbol} blocked — weekend")
         return False
     return True
 
-# ─── V1 FILTERS (CARRIED FORWARD) ────────────────────────────────────────────
+def volatility_filter_passes(symbol, closes):
+    if not ENABLE_VOLATILITY_FILTER or len(closes) < 5:
+        return True
+    recent    = closes[-5:]
+    range_pct = (max(recent) - min(recent)) / min(recent) * 100
+    passes    = range_pct >= 0.8
+    if not passes:
+        send_telegram(f"⏸️ <b>SKIPPED — FLAT</b>\n{symbol}: {round(range_pct,3)}%", private=True)
+    return passes
+
+def dual_tf_allows_new_entry(symbol, signal):
+    if not ENABLE_DUAL_TIMEFRAME:
+        return True
+    _, _, closes_15m, _ = get_candles(symbol, interval=DUAL_TF_INTERVAL)
+    if len(closes_15m) < EMA_SLOW + 5:
+        return True
+    fast_15m = calc_ema(closes_15m, EMA_FAST)
+    slow_15m = calc_ema(closes_15m, EMA_SLOW)
+    agrees   = fast_15m > slow_15m if signal == "buy" else fast_15m < slow_15m
+    if not agrees:
+        send_telegram(f"⏸️ <b>SKIPPED — DUAL TF</b>\n{symbol}", private=True)
+    return agrees
+
+def lsma_macro_confirms(symbol, closes, signal):
+    if not ENABLE_LSMA_FILTER or len(closes) < LSMA_PERIOD:
+        return True
+    lsma400  = calc_lsma(closes, LSMA_PERIOD)
+    price    = closes[-1]
+    above    = price > lsma400
+    confirms = (signal == "buy" and above) or (signal == "sell" and not above)
+    print(f"[LSMA] {symbol} price={round(price,4)} lsma={round(lsma400,4)} confirms={confirms}")
+    if not confirms:
+        send_telegram(f"⏸️ <b>SKIPPED — LSMA MACRO</b>\n{symbol}", private=True)
+    return confirms
+
+def check_hard_stop(symbol):
+    if not ENABLE_HARD_STOP_LOSS:
+        return False
+    if symbol not in entry_price or symbol not in last_signal:
+        return False
+    price = get_price(symbol)
+    if not price:
+        return False
+    ep       = entry_price[symbol]
+    sig      = last_signal[symbol]
+    lev      = get_leverage(symbol)
+    if ep == 0:
+        return False
+    loss_pct = ((ep - price) / ep * 100 * lev) if sig == "buy" \
+               else ((price - ep) / ep * 100 * lev)
+    if loss_pct >= STOP_LOSS_PCT:
+        raw = round(loss_pct / lev, 2)
+        print(f"[STOP] {symbol} hard stop — {round(loss_pct,2)}% leveraged")
+        send_telegram(
+            f"🛑 <b>HARD STOP LOSS</b>\n"
+            f"Symbol: {symbol}\n"
+            f"Entry: ${ep} | Now: ${price}\n"
+            f"Price move: -{raw}% | Leveraged: -{round(loss_pct,2)}%",
+            private=True
+        )
+        return True
+    return False
+
 def check_early_warning(symbol):
     if symbol not in last_signal:
         return False
@@ -677,9 +844,7 @@ def check_early_warning(symbol):
     ema34  = calc_ema(hlc3, EMA_WARN)
     last_h = hlc3[-1]
     sig    = last_signal[symbol]
-    if sig == "buy"  and last_h < ema34:  return True
-    if sig == "sell" and last_h >= ema34: return True
-    return False
+    return (sig == "buy" and last_h < ema34) or (sig == "sell" and last_h >= ema34)
 
 def check_early_signal_alert(symbol, closes):
     if len(closes) < EMA_SLOW + 5:
@@ -696,99 +861,12 @@ def check_early_signal_alert(symbol, closes):
         return
     early_signal_alerted[symbol] = alert_key
     send_telegram(
-        f"👀 <b>EARLY SIGNAL ALERT</b>\n"
-        f"Symbol: {symbol}\n"
-        f"Direction: {direction}\n"
-        f"Price: ${round(closes[-1], 4)}\n"
-        f"EMA gap: {round(gap_pct, 3)}%\n"
-        f"Current position: {last_signal.get(symbol, 'none')}\n"
-        f"⚠️ Not confirmed — bot waiting for candle close",
+        f"👀 <b>EARLY SIGNAL</b>\n"
+        f"{symbol} | {direction}\n"
+        f"Price: ${round(closes[-1],4)} | Gap: {round(gap_pct,3)}%\n"
+        f"⚠️ Not confirmed yet",
         private=True
     )
-
-def volatility_filter_passes(symbol, closes):
-    if not ENABLE_VOLATILITY_FILTER:
-        return True
-    recent    = closes[-5:]
-    range_pct = (max(recent) - min(recent)) / min(recent) * 100
-    passes    = range_pct >= 0.8
-    if not passes:
-        send_telegram(
-            f"⏸️ <b>ENTRY SKIPPED — LOW VOLATILITY</b>\n"
-            f"Symbol: {symbol} | Range: {round(range_pct,3)}%",
-            private=True
-        )
-    return passes
-
-def dual_tf_allows_new_entry(symbol, signal):
-    if not ENABLE_DUAL_TIMEFRAME:
-        return True
-    try:
-        _, _, closes_15m, _ = get_candles(symbol, interval=DUAL_TF_INTERVAL)
-        if len(closes_15m) < EMA_SLOW + 5:
-            return True
-        fast_15m = calc_ema(closes_15m, EMA_FAST)
-        slow_15m = calc_ema(closes_15m, EMA_SLOW)
-        agrees   = fast_15m > slow_15m if signal == "buy" else fast_15m < slow_15m
-        if not agrees:
-            send_telegram(
-                f"⏸️ <b>ENTRY SKIPPED — DUAL TF</b>\n"
-                f"Symbol: {symbol} | 60m: {signal.upper()} | 15m disagrees",
-                private=True
-            )
-        return agrees
-    except Exception as e:
-        print(f"[DUAL TF] Error {symbol}: {e}")
-        return True
-
-def lsma_macro_confirms(symbol, closes, signal):
-    if not ENABLE_LSMA_FILTER:
-        return True
-    if len(closes) < LSMA_PERIOD:
-        return True
-    lsma400  = calc_lsma(closes, LSMA_PERIOD)
-    price    = closes[-1]
-    above    = price > lsma400
-    confirms = (signal == "buy" and above) or (signal == "sell" and not above)
-    print(f"[LSMA] {symbol} | price={round(price,4)} | "
-          f"LSMA400={round(lsma400,4)} | above={above} | confirms={confirms}")
-    if not confirms:
-        send_telegram(
-            f"⏸️ <b>ENTRY SKIPPED — LSMA MACRO</b>\n"
-            f"Symbol: {symbol}\n"
-            f"{'Price below LSMA400 — no longs' if signal == 'buy' else 'Price above LSMA400 — no shorts'}",
-            private=True
-        )
-    return confirms
-
-def check_hard_stop(symbol):
-    if not ENABLE_HARD_STOP_LOSS:
-        return False
-    if symbol not in entry_price or symbol not in last_signal:
-        return False
-    price = get_price(symbol)
-    if not price:
-        return False
-    ep       = entry_price[symbol]
-    sig      = last_signal[symbol]
-    lev      = get_leverage(symbol)
-    if ep == 0:
-        return False
-    loss_pct = ((ep - price) / ep * 100 * lev) if sig == "buy" else ((price - ep) / ep * 100 * lev)
-    if loss_pct >= STOP_LOSS_PCT:
-        raw_loss = round(loss_pct / lev, 2)
-        print(f"[STOP] {symbol} hard stop — loss={round(loss_pct,2)}% leveraged")
-        send_telegram(
-            f"🛑 <b>HARD STOP LOSS</b>\n"
-            f"Symbol: {symbol}\n"
-            f"Entry: ${ep} | Current: ${price}\n"
-            f"Price move: -{raw_loss}%\n"
-            f"Leveraged loss ({lev}x): -{round(loss_pct,2)}%\n"
-            f"Closing now",
-            private=True
-        )
-        return True
-    return False
 
 # ─── TRADE LOGGING ────────────────────────────────────────────────────────────
 def init_log():
@@ -797,27 +875,24 @@ def init_log():
     try:
         if not os.path.exists(LOG_FILE):
             with open(LOG_FILE, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
+                csv.writer(f).writerow([
                     "timestamp", "symbol", "action", "side",
-                    "price", "qty", "peak_profit_pct", "locked_profit_pct",
-                    "closed_pnl", "daily_pnl", "reason"
+                    "price", "qty", "peak_pct", "locked_pct",
+                    "trade_pnl", "daily_pnl", "reason"
                 ])
-            print(f"[LOG] Trade log created: {LOG_FILE}")
     except Exception as e:
         print(f"[LOG] Init error: {e}")
 
-def log_trade(symbol, action, side, price, qty=0, peak=0, locked=0, closed_pnl=0, reason=""):
+def log_trade(symbol, action, side, price, qty=0, peak=0, locked=0, pnl=0, reason=""):
     if not ENABLE_TRADE_LOGGING:
         return
     try:
         with open(LOG_FILE, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
+            csv.writer(f).writerow([
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 symbol, action, side, price, qty,
                 round(peak, 3), round(locked, 3),
-                round(closed_pnl, 4), round(daily_pnl["pnl"], 4), reason
+                round(pnl, 4), round(daily_pnl["pnl"], 4), reason
             ])
     except Exception as e:
         print(f"[LOG] Write error: {e}")
@@ -826,7 +901,6 @@ def log_trade(symbol, action, side, price, qty=0, peak=0, locked=0, closed_pnl=0
 def check_signal(symbol):
     highs, lows, closes, volumes = get_candles(symbol)
     if len(closes) < EMA_SLOW + 5:
-        print(f"[ERROR] Not enough candles for {symbol}")
         return None, None, None, None, None
     fast_now   = calc_ema(closes,      EMA_FAST)
     slow_now   = calc_ema(closes,      EMA_SLOW)
@@ -839,85 +913,71 @@ def check_signal(symbol):
           f"C1 {round(fast_prev,2)}/{round(slow_prev,2)} | "
           f"NOW {round(fast_now,2)}/{round(slow_now,2)}")
     check_early_signal_alert(symbol, closes)
-    buy_signal  = (fast_prev2 < slow_prev2 and fast_prev > slow_prev and fast_now > slow_now)
-    sell_signal = (fast_prev2 > slow_prev2 and fast_prev < slow_prev and fast_now < slow_now)
-    if buy_signal:
-        return "buy",  highs, lows, closes, volumes
-    if sell_signal:
-        return "sell", highs, lows, closes, volumes
+    buy  = fast_prev2 < slow_prev2 and fast_prev > slow_prev and fast_now > slow_now
+    sell = fast_prev2 > slow_prev2 and fast_prev < slow_prev and fast_now < slow_now
+    if buy:  return "buy",  highs, lows, closes, volumes
+    if sell: return "sell", highs, lows, closes, volumes
     return None, highs, lows, closes, volumes
 
-# ─── LEVERAGE ─────────────────────────────────────────────────────────────────
+# ─── EXCHANGE ACTIONS ─────────────────────────────────────────────────────────
 def set_leverage(symbol):
-    lev     = str(get_leverage(symbol))
-    body    = {"category": "linear", "symbol": symbol,
-               "buyLeverage": lev, "sellLeverage": lev}
-    headers = sign(body)
-    r = requests.post(f"{BASE_URL_PRIVATE}/v5/position/set-leverage",
-        headers=headers, json=body, timeout=10)
-    result = r.json()
-    if result.get("retCode") not in [0, 110043]:
+    lev    = str(get_leverage(symbol))
+    body   = {"category": "linear", "symbol": symbol,
+              "buyLeverage": lev, "sellLeverage": lev}
+    result = safe_request("POST", f"{BASE_URL_PRIVATE}/v5/position/set-leverage",
+                          headers=sign_post(body), json_body=body)
+    if result and result.get("retCode") not in [0, 110043]:
         print(f"[WARN] Leverage {symbol}: {result}")
 
-# ─── PARTIAL CLOSE ────────────────────────────────────────────────────────────
 def partial_close(symbol, pct=PARTIAL_PCT):
-    try:
-        params  = {"category": "linear", "symbol": symbol}
-        headers = sign_get(params)
-        r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
-            headers=headers, params=params, timeout=10)
-        for pos in r.json().get("result", {}).get("list", []):
-            size = float(pos.get("size", 0))
-            if size > 0:
-                precision  = get_qty_precision(symbol)
-                close_qty  = round(size * pct, precision)
-                if close_qty <= 0:
-                    return
-                close_side = "Sell" if pos["side"] == "Buy" else "Buy"
-                body       = {
-                    "category": "linear", "symbol": symbol,
-                    "side": close_side, "orderType": "Market",
-                    "qty": str(close_qty), "reduceOnly": True
-                }
-                headers2 = sign(body)
-                r2 = requests.post(f"{BASE_URL_PRIVATE}/v5/order/create",
-                    headers=headers2, json=body, timeout=10)
-                print(f"[PARTIAL] {symbol} closed {int(pct*100)}% ({close_qty}) | {r2.json()}")
-                time.sleep(1)
-                update_daily_pnl(symbol)
-                send_telegram(
-                    f"⚠️ <b>EARLY WARNING — PARTIAL CLOSE</b>\n"
-                    f"Symbol: {symbol}\n"
-                    f"Closed: {int(pct*100)}% ({close_qty} of {size})\n"
-                    f"HLC3 crossed EMA34 — possible reversal\n"
-                    f"Daily PnL: ${round(daily_pnl['pnl'], 2)}"
-                )
-    except Exception as e:
-        print(f"[ERROR] Partial close failed {symbol}: {e}")
-        traceback.print_exc()
-
-# ─── CLOSE POSITION ───────────────────────────────────────────────────────────
-def close_position(symbol, reason="signal"):
     params  = {"category": "linear", "symbol": symbol}
-    headers = sign_get(params)
-    r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
-        headers=headers, params=params, timeout=10)
+    result  = safe_request("GET", f"{BASE_URL_PRIVATE}/v5/position/list",
+                           headers=sign_get(params), params=params)
+    if not result:
+        return
+    for pos in result.get("result", {}).get("list", []):
+        size = float(pos.get("size", 0))
+        if size > 0:
+            precision = get_qty_precision(symbol)
+            close_qty = round(size * pct, precision)
+            if close_qty <= 0:
+                return
+            close_side = "Sell" if pos["side"] == "Buy" else "Buy"
+            body = {"category": "linear", "symbol": symbol,
+                    "side": close_side, "orderType": "Market",
+                    "qty": str(close_qty), "reduceOnly": True}
+            safe_request("POST", f"{BASE_URL_PRIVATE}/v5/order/create",
+                         headers=sign_post(body), json_body=body)
+            print(f"[PARTIAL] {symbol} {int(pct*100)}% ({close_qty})")
+            time.sleep(1)
+            update_daily_pnl(symbol)
+            send_telegram(
+                f"⚠️ <b>PARTIAL CLOSE</b>\n"
+                f"{symbol}: {int(pct*100)}% closed\n"
+                f"HLC3 crossed EMA34"
+            )
+
+def close_position(symbol, reason="signal"):
+    params = {"category": "linear", "symbol": symbol}
+    result = safe_request("GET", f"{BASE_URL_PRIVATE}/v5/position/list",
+                          headers=sign_get(params), params=params)
+    if not result:
+        return
     closed         = False
-    close_qty      = 0
     close_side_str = ""
-    for pos in r.json().get("result", {}).get("list", []):
+    close_qty      = 0
+    for pos in result.get("result", {}).get("list", []):
         size = float(pos.get("size", 0))
         if size > 0:
             close_side     = "Sell" if pos["side"] == "Buy" else "Buy"
             close_side_str = close_side
             close_qty      = size
-            body    = {"category": "linear", "symbol": symbol,
-                       "side": close_side, "orderType": "Market",
-                       "qty": str(size), "reduceOnly": True}
-            headers = sign(body)
-            r2 = requests.post(f"{BASE_URL_PRIVATE}/v5/order/create",
-                headers=headers, json=body, timeout=10)
-            print(f"[CLOSE] {symbol} {pos['side']} size={size}: {r2.json()}")
+            body = {"category": "linear", "symbol": symbol,
+                    "side": close_side, "orderType": "Market",
+                    "qty": str(size), "reduceOnly": True}
+            safe_request("POST", f"{BASE_URL_PRIVATE}/v5/order/create",
+                         headers=sign_post(body), json_body=body)
+            print(f"[CLOSE] {symbol} {pos['side']} size={size}")
             closed = True
     if closed:
         time.sleep(1)
@@ -927,79 +987,57 @@ def close_position(symbol, reason="signal"):
         pk         = round(peak_profit.get(symbol, 0), 2)
         lk         = round(locked_profit.get(symbol, 0), 2)
         ep         = entry_price.get(symbol, 0)
-
-        # V2.1 — record result for performance tracking and consecutive loss
         record_trade_result(symbol, trade_pnl)
-        log_trade(symbol, "EXIT", close_side_str, get_price(symbol) or 0,
-                  close_qty, pk, lk, trade_pnl, reason)
-
+        log_trade(symbol, "EXIT", close_side_str,
+                  get_price(symbol) or 0, close_qty, pk, lk, trade_pnl, reason)
         entry_price.pop(symbol, None)
         peak_profit.pop(symbol, None)
         locked_profit.pop(symbol, None)
         early_warning_fired.discard(symbol)
         early_signal_alerted.pop(symbol, None)
-
+        save_state()
         send_telegram(
             f"🔴 <b>POSITION CLOSED</b>\n"
             f"Symbol: {symbol}\n"
-            f"Entry: ${ep}\n"
-            f"Peak profit: {pk}%\n"
+            f"Entry: ${ep} | Peak: {pk}%\n"
             f"Reason: {reason}\n"
-            f"Daily PnL: ${round(daily_pnl['pnl'], 2)}"
+            f"Daily PnL: ${round(daily_pnl['pnl'],2)}"
         )
 
-# ─── PLACE ORDER ──────────────────────────────────────────────────────────────
 def place_order(symbol, signal, highs=None, lows=None, closes=None):
-    try:
-        set_leverage(symbol)
-        price = get_price(symbol)
-        if not price:
-            return
-        precision = get_qty_precision(symbol)
-
-        # V2.1 — dynamic sizing if enabled
-        trade_usdt = get_dynamic_trade_usdt(symbol, highs, lows, closes) \
-                     if (ENABLE_DYNAMIC_SIZING and highs) else get_trade_usdt(symbol)
-
-        qty  = round((trade_usdt * get_leverage(symbol)) / price, precision)
-        side = "Buy" if signal == "buy" else "Sell"
-        body = {"category": "linear", "symbol": symbol,
-                "side": side, "orderType": "Market",
-                "qty": str(qty), "timeInForce": "GTC"}
-        headers = sign(body)
-        r = requests.post(f"{BASE_URL_PRIVATE}/v5/order/create",
-            headers=headers, json=body, timeout=10)
-        result = r.json()
-        print(f"[ORDER] {symbol} {side} qty={qty} @ {price} | {result}")
-        if result.get("retCode") == 0:
-            entry_price[symbol]  = price
-            peak_profit[symbol]  = 0.0
-            locked_profit[symbol] = 0.0
-            early_warning_fired.discard(symbol)
-            early_signal_alerted.pop(symbol, None)
-            print(f"[ENTRY] {symbol} entry set: {price}")
-            log_trade(symbol, "ENTRY", side, price, qty, reason="EMA crossover")
-            send_telegram(
-                f"🟢 <b>NEW TRADE</b>\n"
-                f"Symbol: {symbol}\n"
-                f"Side: {side}\n"
-                f"Entry: ${price}\n"
-                f"Daily PnL: ${round(daily_pnl['pnl'], 2)}"
-            )
-        return result
-    except Exception as e:
-        print(f"[ERROR] Order failed {symbol}: {e}")
-        traceback.print_exc()
-
-def send_signal_only_alert(symbol, signal, price):
-    side = "BUY 🟢" if signal == "buy" else "SELL 🔴"
-    send_telegram(
-        f"📡 <b>SIGNAL ALERT</b>\n"
-        f"Symbol: {symbol}\n"
-        f"Direction: {side}\n"
-        f"Price: ${price}\n"
-        f"⚠️ Monitoring mode — not trading"
-    )
+    set_leverage(symbol)
+    price = get_price(symbol)
+    if not price:
+        print(f"[ERROR] Price unavailable for {symbol}")
+        return
+    precision  = get_qty_precision(symbol)
+    trade_usdt = get_dynamic_trade_usdt(symbol, highs, lows, closes) \
+                 if (ENABLE_DYNAMIC_SIZING and highs) else get_trade_usdt(symbol)
+    qty  = round((trade_usdt * get_leverage(symbol)) / price, precision)
+    side = "Buy" if signal == "buy" else "Sell"
+    body = {"category": "linear", "symbol": symbol,
+            "side": side, "orderType": "Market",
+            "qty": str(qty), "timeInForce": "GTC"}
+    result = safe_request("POST", f"{BASE_URL_PRIVATE}/v5/order/create",
+                          headers=sign_post(body), json_body=body)
+    if not result:
+        print(f"[ERROR] Order failed for {symbol}")
+        return
+    print(f"[ORDER] {symbol} {side} qty={qty} @ {price} | retCode={result.get('retCode')}")
+    if result.get("retCode") == 0:
+        entry_price[symbol]   = price
+        peak_profit[symbol]   = 0.0
+        locked_profit[symbol] = 0.0
+        early_warning_fired.discard(symbol)
+        early_signal_alerted.pop(symbol, None)
+        log_trade(symbol, "ENTRY", side, price, qty, reason="EMA crossover")
+        save_state()
+        send_telegram(
+            f"🟢 <b>NEW TRADE</b>\n"
+            f"Symbol: {symbol}\n"
+            f"Side: {side} | Entry: ${price}\n"
+            f"Daily PnL: ${round(daily_pnl['pnl'],2)}"
+        )
 
 def close_all_positions():
     for symbol in SYMBOLS:
@@ -1009,10 +1047,19 @@ def close_all_positions():
             last_signal.pop(symbol, None)
     print("[RISK] All positions closed")
 
+def send_signal_only_alert(symbol, signal, price):
+    send_telegram(
+        f"📡 <b>SIGNAL ALERT</b>\n"
+        f"{symbol} | {'BUY 🟢' if signal == 'buy' else 'SELL 🔴'}\n"
+        f"Price: ${price}\n"
+        f"⚠️ Monitoring mode — not trading"
+    )
+
 # ─── REAL-TIME MONITOR ────────────────────────────────────────────────────────
 def realtime_retrace_monitor():
     print("[MONITOR] Real-time monitor started — checking every 45s")
     while True:
+        heartbeat("monitor")
         try:
             mode = get_mode()
             if mode == "trading" and not daily_pnl["stopped"]:
@@ -1020,73 +1067,76 @@ def realtime_retrace_monitor():
                     if is_symbol_paused(symbol):
                         continue
                     lock = symbol_locks.get(symbol)
-                    if not lock:
-                        continue
-                    if not lock.acquire(blocking=False):
+                    if not lock or not lock.acquire(blocking=False):
                         continue
                     try:
-                        # Hard stop loss
                         if check_hard_stop(symbol):
                             close_position(symbol, reason="hard stop loss")
                             last_signal.pop(symbol, None)
                             continue
-                        # Early warning partial close
                         if is_early_warning_on(symbol) and symbol not in early_warning_fired:
                             if check_early_warning(symbol):
                                 partial_close(symbol, PARTIAL_PCT)
                                 early_warning_fired.add(symbol)
-                        # Peak retrace / profit lock
                         if symbol in last_signal and check_peak_retrace(symbol):
                             send_telegram(
                                 f"📉 <b>RETRACE EXIT</b>\n"
-                                f"Symbol: {symbol}\n"
-                                f"Peak: {round(peak_profit.get(symbol,0),2)}%\n"
-                                f"Locked floor: {round(locked_profit.get(symbol,0),2)}%"
+                                f"{symbol} | Peak: {round(peak_profit.get(symbol,0),2)}%\n"
+                                f"Lock floor: {round(locked_profit.get(symbol,0),2)}%"
                             )
                             close_position(symbol, reason="retrace")
                             last_signal.pop(symbol, None)
                     finally:
                         lock.release()
         except Exception as e:
-            print(f"[ERROR] Monitor: {e}")
+            print(f"[MONITOR] Error: {e}")
             traceback.print_exc()
         time.sleep(45)
 
 # ─── BOT LOOP ─────────────────────────────────────────────────────────────────
 def run_bot():
     print("=" * 62)
-    print("  GKC BOT — VERSION 2.1")
-    print("  Built by Hazak | @cryptoedgelab")
-    print(f"  Timeframe: {INTERVAL}m | Min profit: {MIN_PROFIT_TO_TRACK}%")
+    print("  GKC BOT — VERSION 2.2  |  Production Ready")
+    print("  Built by Hazak | @cryptoedgelab | Base by GK")
+    print(f"  Timeframe: {INTERVAL}m | Daily limit: -${MAX_DAILY_LOSS}")
     print("  SYMBOLS:")
     for s, cfg in SYMBOL_CONFIG.items():
-        status = "PAUSED" if cfg.get("paused") else f"${cfg['trade_usdt']} x {cfg['leverage']}x"
-        print(f"    {s}: {status}")
+        st = "PAUSED" if cfg.get("paused") else f"${cfg['trade_usdt']} x {cfg['leverage']}x"
+        print(f"    {s}: {st}")
     print("  V1 FLAGS:")
-    print(f"    Trade Logging:      {'ON' if ENABLE_TRADE_LOGGING     else 'OFF'}")
-    print(f"    Hard Stop Loss:     {'ON' if ENABLE_HARD_STOP_LOSS    else 'OFF'} ({STOP_LOSS_PCT}% lev)")
-    print(f"    Dual Timeframe:     {'ON' if ENABLE_DUAL_TIMEFRAME    else 'OFF'}")
-    print(f"    LSMA400 Filter:     {'ON' if ENABLE_LSMA_FILTER       else 'OFF'}")
-    print(f"    Volatility Filter:  {'ON' if ENABLE_VOLATILITY_FILTER else 'OFF'}")
+    print(f"    Trade Logging:    {'ON' if ENABLE_TRADE_LOGGING     else 'OFF'}")
+    print(f"    Hard Stop Loss:   {'ON' if ENABLE_HARD_STOP_LOSS    else 'OFF'} ({STOP_LOSS_PCT}% lev)")
+    print(f"    Dual Timeframe:   {'ON' if ENABLE_DUAL_TIMEFRAME    else 'OFF'}")
+    print(f"    LSMA400:          {'ON' if ENABLE_LSMA_FILTER       else 'OFF'}")
+    print(f"    Volatility:       {'ON' if ENABLE_VOLATILITY_FILTER else 'OFF'}")
     print("  V2.1 FLAGS:")
-    print(f"    ATR Filter:         {'ON' if ENABLE_ATR_FILTER        else 'OFF'}")
-    print(f"    Consecutive Loss:   {'ON' if ENABLE_CONSECUTIVE_LOSS  else 'OFF'}")
-    print(f"    Dynamic Sizing:     {'ON' if ENABLE_DYNAMIC_SIZING    else 'OFF'}")
-    print(f"    Market Regime:      {'ON' if ENABLE_MARKET_REGIME     else 'OFF'}")
-    print(f"    Profit Locking:     {'ON' if ENABLE_PROFIT_LOCKING    else 'OFF'}")
-    print(f"    Volume Filter:      {'ON' if ENABLE_VOLUME_FILTER     else 'OFF'}")
-    print(f"    Time Filter:        {'ON' if ENABLE_TIME_FILTER       else 'OFF'}")
+    print(f"    ATR Filter:       {'ON' if ENABLE_ATR_FILTER        else 'OFF'}")
+    print(f"    Consec. Loss:     {'ON' if ENABLE_CONSECUTIVE_LOSS  else 'OFF'}")
+    print(f"    Dynamic Sizing:   {'ON' if ENABLE_DYNAMIC_SIZING    else 'OFF'}")
+    print(f"    Market Regime:    {'ON' if ENABLE_MARKET_REGIME     else 'OFF'}")
+    print(f"    Profit Locking:   {'ON' if ENABLE_PROFIT_LOCKING    else 'OFF'}")
+    print(f"    Volume Filter:    {'ON' if ENABLE_VOLUME_FILTER     else 'OFF'}")
+    print(f"    Time Filter:      {'ON' if ENABLE_TIME_FILTER       else 'OFF'}")
+    print("  V2.2 CORE:")
+    print("    ✅ Async Telegram queue")
+    print("    ✅ Safe request wrapper + backoff")
+    print("    ✅ Persistent JSON state")
+    print("    ✅ Health watchdog")
     print("=" * 62)
     init_log()
+    load_state()
     sync_state_from_bybit()
 
     while True:
         try:
+            heartbeat("bot")
             wait_for_candle_close()
             check_daily_reset()
+            clear_scan_cache()
 
             mode = get_mode()
-            print(f"\n[SCAN] {time.strftime('%Y-%m-%d %H:%M:%S')} UTC | MODE: {mode.upper()} | V2.1")
+            print(f"\n[SCAN] {time.strftime('%Y-%m-%d %H:%M:%S')} UTC | "
+                  f"MODE: {mode.upper()} | V2.2")
             bot_status["last_scan"] = time.strftime('%Y-%m-%d %H:%M:%S UTC')
             bot_status["mode"]      = mode
             print(f"[STATUS] PnL=${round(daily_pnl['pnl'],2)} | "
@@ -1102,11 +1152,9 @@ def run_bot():
 
             if daily_pnl["pnl"] <= -MAX_DAILY_LOSS:
                 daily_pnl["stopped"] = True
-                print("[RISK] Max daily loss reached")
                 send_telegram(
                     f"🚨 <b>DAILY LOSS LIMIT HIT</b>\n"
-                    f"Loss: ${round(daily_pnl['pnl'],2)}\n"
-                    f"Limit: -${MAX_DAILY_LOSS}\n"
+                    f"Loss: ${round(daily_pnl['pnl'],2)} | Limit: -${MAX_DAILY_LOSS}\n"
                     f"Closing all — bot stopped for today",
                     private=True
                 )
@@ -1125,12 +1173,12 @@ def run_bot():
                     continue
 
                 with lock:
-                    # V2.1 — consecutive loss cooldown check
+                    # V2.1 — consecutive loss cooldown
                     if check_consecutive_loss_limit(symbol):
-                        print(f"[COOLDOWN] {symbol} — on cooldown, skipping")
+                        print(f"[COOLDOWN] {symbol} — skipping")
                         continue
 
-                    # Retrace backup at candle close
+                    # Retrace at candle close (backup for monitor)
                     if mode == "trading" and symbol in last_signal:
                         if check_peak_retrace(symbol):
                             print(f"[RETRACE] {symbol} — closing at candle")
@@ -1138,56 +1186,27 @@ def run_bot():
                             last_signal.pop(symbol, None)
                             continue
 
-                    # Signal check
                     signal, highs, lows, closes, volumes = check_signal(symbol)
                     prev = last_signal.get(symbol)
-                    print(f"[SIGNAL] {symbol} | current={signal} | previous={prev} | mode={mode}")
+                    print(f"[SIGNAL] {symbol} | current={signal} | prev={prev} | mode={mode}")
 
                     if signal and signal != prev:
 
                         if mode == "trading":
-                            # Always close existing position on flip — no filter
+                            # Always close existing position first — never filtered
                             if prev and symbol in entry_price:
-                                print(f"[EXIT] {symbol} closing {prev} on signal flip")
+                                print(f"[EXIT] {symbol} closing {prev} on flip")
                                 close_position(symbol, reason="signal flip")
                                 last_signal.pop(symbol, None)
 
                             # ── Entry filters — NEW entries only ──
-
-                            # Time filter
-                            if not time_allows_entry(symbol):
-                                print(f"[TIME] {symbol} — bad hour, no new entry")
-                                continue
-
-                            # ATR filter (V2.1)
-                            if highs and not atr_filter_passes(symbol, highs, lows, closes):
-                                print(f"[ATR] {symbol} too quiet — no new entry")
-                                continue
-
-                            # Volatility filter (V1 legacy)
-                            if closes and not volatility_filter_passes(symbol, closes):
-                                print(f"[VOL] {symbol} flat — no new entry")
-                                continue
-
-                            # Market regime (V2.1)
-                            if highs and not market_is_trending(symbol, highs, lows, closes):
-                                print(f"[REGIME] {symbol} ranging — no new entry")
-                                continue
-
-                            # Volume confirmation (V2.1)
-                            if volumes and not volume_confirms(symbol, volumes):
-                                print(f"[VOLUME] {symbol} weak — no new entry")
-                                continue
-
-                            # LSMA macro (V1)
-                            if closes and not lsma_macro_confirms(symbol, closes, signal):
-                                print(f"[LSMA] {symbol} macro disagrees — no new entry")
-                                continue
-
-                            # Dual timeframe (V1)
-                            if not dual_tf_allows_new_entry(symbol, signal):
-                                print(f"[DUAL TF] {symbol} 15m disagrees — no new entry")
-                                continue
+                            if not time_allows_entry(symbol):          continue
+                            if highs and not atr_filter_passes(symbol, highs, lows, closes): continue
+                            if closes and not volatility_filter_passes(symbol, closes):       continue
+                            if highs and not market_is_trending(symbol, highs, lows, closes): continue
+                            if volumes and not volume_confirms(symbol, volumes):              continue
+                            if closes and not lsma_macro_confirms(symbol, closes, signal):   continue
+                            if not dual_tf_allows_new_entry(symbol, signal):                 continue
 
                             print(f"[ORDER] {symbol} {signal.upper()} — all filters passed")
                             place_order(symbol, signal, highs, lows, closes)
@@ -1196,7 +1215,6 @@ def run_bot():
 
                         elif mode == "signal_only":
                             price = get_price(symbol) or 0
-                            print(f"[SIGNAL ONLY] {symbol} {signal.upper()} — alerting community")
                             send_signal_only_alert(symbol, signal, price)
                             last_signal[symbol] = signal
                             bot_status["last_signal"] = last_signal.copy()
@@ -1214,7 +1232,7 @@ def run_bot():
 @app.route("/")
 def index():
     return jsonify({
-        "version":     "2.1",
+        "version":     "2.2",
         "status":      "running",
         "mode":        get_mode(),
         "bot":         bot_status,
@@ -1223,11 +1241,16 @@ def index():
         "peak_profit": peak_profit,
         "locked_profit": locked_profit,
         "daily_pnl":   daily_pnl,
-        "symbols":     {s: {**cfg, "early_warning_fired": s in early_warning_fired,
-                            "consecutive_losses": consecutive_losses.get(s, 0),
-                            "on_cooldown": cooldown_candles.get(s, 0) > 0}
-                        for s, cfg in SYMBOL_CONFIG.items()},
-        "interval":    f"{INTERVAL}m",
+        "symbols": {
+            s: {
+                **cfg,
+                "early_warning_fired":  s in early_warning_fired,
+                "consecutive_losses":   consecutive_losses.get(s, 0),
+                "on_cooldown":          cooldown_candles.get(s, 0) > 0,
+            }
+            for s, cfg in SYMBOL_CONFIG.items()
+        },
+        "interval": f"{INTERVAL}m",
         "v1_features": {
             "trade_logging":     ENABLE_TRADE_LOGGING,
             "hard_stop_loss":    ENABLE_HARD_STOP_LOSS,
@@ -1236,13 +1259,19 @@ def index():
             "volatility_filter": ENABLE_VOLATILITY_FILTER,
         },
         "v21_features": {
-            "atr_filter":        ENABLE_ATR_FILTER,
-            "consecutive_loss":  ENABLE_CONSECUTIVE_LOSS,
-            "dynamic_sizing":    ENABLE_DYNAMIC_SIZING,
-            "market_regime":     ENABLE_MARKET_REGIME,
-            "profit_locking":    ENABLE_PROFIT_LOCKING,
-            "volume_filter":     ENABLE_VOLUME_FILTER,
-            "time_filter":       ENABLE_TIME_FILTER,
+            "atr_filter":       ENABLE_ATR_FILTER,
+            "consecutive_loss": ENABLE_CONSECUTIVE_LOSS,
+            "dynamic_sizing":   ENABLE_DYNAMIC_SIZING,
+            "market_regime":    ENABLE_MARKET_REGIME,
+            "profit_locking":   ENABLE_PROFIT_LOCKING,
+            "volume_filter":    ENABLE_VOLUME_FILTER,
+            "time_filter":      ENABLE_TIME_FILTER,
+        },
+        "v22_core": {
+            "async_telegram":   True,
+            "safe_requests":    True,
+            "persistent_state": True,
+            "health_watchdog":  True,
         }
     })
 
@@ -1251,11 +1280,12 @@ def status():
     try:
         positions = {}
         for symbol in SYMBOLS:
-            params  = {"category": "linear", "symbol": symbol}
-            headers = sign_get(params)
-            r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
-                headers=headers, params=params, timeout=10)
-            for pos in r.json().get("result", {}).get("list", []):
+            params = {"category": "linear", "symbol": symbol}
+            result = safe_request("GET", f"{BASE_URL_PRIVATE}/v5/position/list",
+                                  headers=sign_get(params), params=params)
+            if not result:
+                continue
+            for pos in result.get("result", {}).get("list", []):
                 size = float(pos.get("size", 0))
                 if size > 0:
                     positions[symbol] = {
@@ -1267,9 +1297,10 @@ def status():
                         "peak_profit":    round(peak_profit.get(symbol, 0), 3),
                         "locked_profit":  round(locked_profit.get(symbol, 0), 3),
                         "paused":         is_symbol_paused(symbol),
+                        "on_cooldown":    cooldown_candles.get(symbol, 0) > 0,
                     }
         return jsonify({
-            "version":        "2.1",
+            "version":        "2.2",
             "mode":           get_mode(),
             "open_positions": positions,
             "last_signal":    last_signal,
@@ -1281,9 +1312,8 @@ def status():
 
 @app.route("/performance")
 def perf():
-    """V2.1 — per-symbol win rate dashboard"""
     return jsonify({
-        "version":     "2.1",
+        "version":     "2.2",
         "performance": performance,
         "daily_pnl":   daily_pnl,
         "mode":        get_mode(),
@@ -1292,24 +1322,23 @@ def perf():
 @app.route("/trading")
 def mode_trading():
     set_mode("trading")
-    send_telegram("⚡ <b>BOT MODE: TRADING</b>\nSignals + orders active", private=True)
-    return jsonify({"mode": "trading"})
+    send_telegram("⚡ <b>BOT MODE: TRADING</b>\nV2.2 — signals + orders active", private=True)
+    return jsonify({"mode": "trading", "version": "2.2"})
 
 @app.route("/signalonly")
 def mode_signal_only():
-    mode = get_mode()
-    if mode == "trading" and last_signal:
+    if get_mode() == "trading" and last_signal:
         close_all_positions()
-        send_telegram("📡 <b>SWITCHING TO SIGNAL ONLY</b>\nAll positions closed first", private=True)
+        send_telegram("📡 <b>SIGNAL ONLY</b>\nAll positions closed first", private=True)
     else:
-        send_telegram("📡 <b>BOT MODE: SIGNAL ONLY</b>\nAlerts active, no orders", private=True)
+        send_telegram("📡 <b>SIGNAL ONLY</b>\nAlerts active — no orders", private=True)
     set_mode("signal_only")
     return jsonify({"mode": "signal_only"})
 
 @app.route("/pause")
 def mode_pause():
     set_mode("paused")
-    send_telegram("⏸️ <b>BOT MODE: PAUSED</b>\nNo signals, no orders", private=True)
+    send_telegram("⏸️ <b>BOT PAUSED</b>\nNo signals, no orders", private=True)
     return jsonify({"mode": "paused"})
 
 @app.route("/pause/<symbol>")
@@ -1326,8 +1355,8 @@ def resume_symbol(symbol):
     if sym not in SYMBOL_CONFIG:
         return jsonify({"error": f"{sym} not found"})
     SYMBOL_CONFIG[sym]["paused"] = False
-    cooldown_candles[sym] = 0
-    consecutive_losses[sym] = 0
+    cooldown_candles[sym]        = 0
+    consecutive_losses[sym]      = 0
     return jsonify({"message": f"{sym} resumed"})
 
 @app.route("/sync")
@@ -1346,34 +1375,41 @@ def closeall():
     except Exception as e:
         return jsonify({"error": str(e)})
 
+@app.route("/savestate")
+def savestate():
+    try:
+        save_state()
+        return jsonify({"message": "State saved", "file": STATE_FILE})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 @app.route("/debug")
 def debug():
     try:
         results = {}
         for symbol in SYMBOLS:
-            params  = {"category": "linear", "symbol": symbol}
-            headers = sign_get(params)
-            r = requests.get(f"{BASE_URL_PRIVATE}/v5/position/list",
-                headers=headers, params=params, timeout=10)
-            results[symbol] = r.json()
+            params = {"category": "linear", "symbol": symbol}
+            results[symbol] = safe_request(
+                "GET", f"{BASE_URL_PRIVATE}/v5/position/list",
+                headers=sign_get(params), params=params
+            )
         return jsonify(results)
     except Exception as e:
         return jsonify({"error": str(e)})
 
 @app.route("/test")
 def test():
-    try:
-        r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/tickers", params={
-            "category": "linear", "symbol": "BTCUSDT"
-        }, timeout=10)
-        return jsonify({
-            "version":      "2.1",
-            "btc_price":    r.json()["result"]["list"][0]["lastPrice"],
-            "api_keys_set": bool(API_KEY and API_SECRET),
-            "mode":         get_mode()
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    result = safe_request("GET", f"{BASE_URL_PUBLIC}/v5/market/tickers",
+                          params={"category": "linear", "symbol": "BTCUSDT"})
+    if not result:
+        return jsonify({"error": "API call failed"})
+    return jsonify({
+        "version":      "2.2",
+        "btc_price":    result["result"]["list"][0]["lastPrice"],
+        "api_keys_set": bool(API_KEY and API_SECRET),
+        "mode":         get_mode(),
+        "telegram_queue_size": telegram_queue.qsize(),
+    })
 
 @app.route("/reset_warning/<symbol>")
 def reset_warning(symbol):
@@ -1381,11 +1417,13 @@ def reset_warning(symbol):
     return jsonify({"message": f"Early warning reset for {symbol.upper()}"})
 
 # ─── START ────────────────────────────────────────────────────────────────────
-bot_thread     = threading.Thread(target=run_bot, daemon=True)
-retrace_thread = threading.Thread(target=realtime_retrace_monitor, daemon=True)
-
-bot_thread.start()
-retrace_thread.start()
+# Register and start all threads through watchdog registry
+telegram_thread   = register_thread("telegram",    telegram_worker)
+bot_thread        = register_thread("bot",          run_bot)
+monitor_thread    = register_thread("monitor",      realtime_retrace_monitor)
+state_thread      = register_thread("state",        state_persistence_worker)
+watchdog_thread   = threading.Thread(target=watchdog, daemon=True, name="watchdog")
+watchdog_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
