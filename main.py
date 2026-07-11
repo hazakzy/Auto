@@ -1,13 +1,17 @@
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║           GKC BOT — VERSION 2.2                                 ║
+# ║           GKC BOT — VERSION 2.2 FINAL                           ║
 # ║           Built by Hazak | Hazak Onchain | @cryptoedgelab       ║
 # ║           Base strategy by GK                                   ║
 # ║                                                                  ║
-# ║  V2.2 Production Upgrades:                                      ║
+# ║  V2.2 Core:                                                     ║
 # ║  ✅ Persistent JSON state (survives restarts)                   ║
 # ║  ✅ Async Telegram queue (never blocks trading)                 ║
 # ║  ✅ Safe request wrapper (retry + exponential backoff)          ║
-# ║  ✅ Health watchdog (detects + restarts dead threads)           ║
+# ║  ✅ Health watchdog with stop events (no duplicate threads)     ║
+# ║  ✅ orderLinkId (prevents duplicate orders)                     ║
+# ║  ✅ Telegram dedup cache (no spam)                              ║
+# ║  ✅ Protected root endpoint                                     ║
+# ║  ✅ Exec ID rebuild on restart                                  ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
 import os
@@ -17,6 +21,7 @@ import hashlib
 import time
 import csv
 import queue
+import uuid
 import requests
 import threading
 import traceback
@@ -33,7 +38,8 @@ BASE_URL_PUBLIC  = "https://api.bybit.com"
 BASE_URL_PRIVATE = "https://api.bybit.com"
 TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "@cryptoedgelab")
-TELEGRAM_PRIVATE_ID = os.environ.get("TELEGRAM_PRIVATE_ID", "5351361684")
+TELEGRAM_PRIVATE_ID = os.environ.get("TELEGRAM_PRIVATE_ID")  # required — no default
+BOT_SECRET_TOKEN    = os.environ.get("BOT_SECRET_TOKEN")      # required for control endpoints
 
 MIN_PROFIT_TO_TRACK = 5.0
 STATE_FILE          = "/tmp/gkc_state.json"  # persistent state file
@@ -63,8 +69,11 @@ INTERVAL  = "60"
 EMA_FAST  = 12
 EMA_SLOW  = 21
 EMA_WARN  = 34
-MAX_DAILY_LOSS = 25
-PARTIAL_PCT    = 0.25
+MAX_DAILY_LOSS          = 25
+MAX_OPEN_POSITIONS      = 4     # max simultaneous open positions across all symbols
+DAILY_PROFIT_TARGET     = 0.0   # 0 = disabled. Set e.g. 30.0 to stop new entries per symbol at +$30 daily
+SYMBOL_DAILY_PNL        = {s: 0.0 for s in ["BTCUSDT","HYPEUSDT","SOLUSDT","ETHUSDT"]}
+PARTIAL_PCT             = 0.25
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  FEATURE FLAGS — All OFF by default                             ║
@@ -144,18 +153,32 @@ def set_mode(mode):
     global BOT_MODE
     with mode_lock:
         BOT_MODE = mode
+    save_state()  # FIX: persist mode immediately so restarts restore correct mode
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  V2.2 UPGRADE #1 — ASYNC TELEGRAM QUEUE                        ║
 # ║  Telegram never blocks trading — messages go into a queue       ║
 # ║  A separate thread sends them in order                          ║
 # ╚══════════════════════════════════════════════════════════════════╝
-telegram_queue = queue.Queue()
+telegram_queue    = queue.Queue(maxsize=500)
+telegram_last_sent = {}   # dedup cache — {message_key: timestamp}
+TELEGRAM_DEDUP_SECS = 60  # suppress identical messages within 60s
 
 def telegram_worker():
     """Background thread — drains the Telegram queue and sends messages"""
     print("[TELEGRAM] Queue worker started")
+    last_cleanup = time.time()
     while True:
+        # FIX: periodic cleanup of dedup cache to prevent memory growth
+        if time.time() - last_cleanup > 300:  # every 5 minutes
+            now = time.time()
+            stale_keys = [k for k, t in list(telegram_last_sent.items())
+                          if now - t > 600]
+            for k in stale_keys:
+                telegram_last_sent.pop(k, None)
+            if stale_keys:
+                print(f"[TELEGRAM] Cleaned {len(stale_keys)} stale dedup keys")
+            last_cleanup = now
         try:
             item = telegram_queue.get(timeout=5)
             if item is None:
@@ -189,8 +212,22 @@ def telegram_worker():
         except Exception as e:
             print(f"[TELEGRAM] Worker error: {e}")
 
-def send_telegram(message, private=False):
-    """Non-blocking — puts message in queue, returns immediately"""
+def send_telegram(message, private=False, dedup_key=None):
+    """
+    Non-blocking — puts message in queue, returns immediately.
+    dedup_key: if set, suppresses identical messages within TELEGRAM_DEDUP_SECS
+    """
+    if dedup_key:
+        now  = time.time()
+        last = telegram_last_sent.get(dedup_key, 0)
+        if now - last < TELEGRAM_DEDUP_SECS:
+            return  # suppress duplicate
+        telegram_last_sent[dedup_key] = now
+
+    if telegram_queue.full():
+        print("[TELEGRAM] Queue full — dropping low-priority message")
+        return
+
     telegram_queue.put((message, private, 0))
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -223,11 +260,21 @@ def safe_request(method, url, headers=None, params=None, json_body=None,
                 time.sleep(wait)
                 continue
 
-            return r.json()
+            # FIX: handle HTML responses (Bybit maintenance pages etc)
+            try:
+                return r.json()
+            except (ValueError, requests.exceptions.JSONDecodeError):
+                print(f"[API] Non-JSON response from {url}: {r.text[:100]}")
+                time.sleep(2 ** attempt)
+                continue
 
         except requests.exceptions.Timeout:
             wait = 2 ** attempt
             print(f"[API] Timeout (attempt {attempt+1}/{max_retries}) — waiting {wait}s")
+            time.sleep(wait)
+        except requests.exceptions.HTTPError as e:
+            wait = 2 ** attempt
+            print(f"[API] HTTP error (attempt {attempt+1}): {e} — waiting {wait}s")
             time.sleep(wait)
         except requests.exceptions.ConnectionError as e:
             wait = 2 ** attempt
@@ -327,6 +374,11 @@ def load_state():
         cooldown_candles.update(state.get("cooldown_candles", {}))
         performance.update(state.get("performance", {}))
 
+        # FIX: restore processed exec IDs to prevent double-counting on restart
+        saved_exec_ids = state.get("processed_exec_ids", [])
+        processed_exec_ids.update(saved_exec_ids)
+        print(f"[STATE] Restored {len(saved_exec_ids)} exec IDs from state")
+
         # Only restore daily PnL if it's from today
         saved_pnl = state.get("daily_pnl", {})
         today     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -336,6 +388,15 @@ def load_state():
         else:
             print("[STATE] Saved PnL is from previous day — resetting")
 
+        # FIX: restore per-symbol pause state
+        saved_paused = state.get("symbol_paused", {})
+        for s, paused in saved_paused.items():
+            if s in SYMBOL_CONFIG:
+                SYMBOL_CONFIG[s]["paused"] = paused
+        if any(saved_paused.values()):
+            print(f"[STATE] Restored paused symbols: "
+                  f"{[s for s, p in saved_paused.items() if p]}")
+
         # Restore mode
         saved_mode = state.get("bot_mode", "trading")
         set_mode(saved_mode)
@@ -344,6 +405,31 @@ def load_state():
 
     except Exception as e:
         print(f"[STATE] Load error: {e} — starting fresh")
+
+def rebuild_exec_ids():
+    """
+    FIX: Rebuild processed_exec_ids from today's executions on startup.
+    Prevents double-counting executions that were already processed before restart.
+    """
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for symbol in SYMBOLS:
+            params  = {"category": "linear", "symbol": symbol, "limit": "50"}
+            result  = safe_request("GET", f"{BASE_URL_PRIVATE}/v5/execution/list",
+                                   headers=sign_get(params), params=params)
+            if not result:
+                continue
+            for trade in result.get("result", {}).get("list", []):
+                trade_time = datetime.fromtimestamp(
+                    int(trade["execTime"]) / 1000, tz=timezone.utc
+                ).strftime("%Y-%m-%d")
+                if trade_time == today:
+                    exec_id = trade.get("execId")
+                    if exec_id:
+                        processed_exec_ids.add(exec_id)
+        print(f"[STATE] Rebuilt exec IDs — {len(processed_exec_ids)} today's executions loaded")
+    except Exception as e:
+        print(f"[STATE] rebuild_exec_ids error: {e}")
 
 def state_persistence_worker():
     """Background thread — saves state every 60 seconds"""
@@ -357,20 +443,41 @@ def state_persistence_worker():
 # ║  Monitors bot and retrace threads every 60s                     ║
 # ║  Restarts dead threads + sends private alert                    ║
 # ╚══════════════════════════════════════════════════════════════════╝
-thread_registry   = {}
-thread_last_alive = {}
+thread_registry      = {}
+thread_last_alive    = {}
+thread_last_alerted  = {}   # prevents spam — track last alert time per thread
+thread_stop_events   = {}   # FIX: stop events so old threads exit before new ones start
 
 def register_thread(name, fn, daemon=True):
-    """Create, register and start a thread"""
-    t = threading.Thread(target=fn, daemon=daemon, name=name)
+    """Create, register and start a thread with a stop event"""
+    stop_event = threading.Event()
+    thread_stop_events[name] = stop_event
+    # Pass stop_event to functions that accept it (bot, monitor)
+    try:
+        t = threading.Thread(target=fn, args=(stop_event,), daemon=daemon, name=name)
+    except TypeError:
+        t = threading.Thread(target=fn, daemon=daemon, name=name)
     t.start()
-    thread_registry[name] = {"fn": fn, "thread": t, "daemon": daemon}
-    thread_last_alive[name] = time.time()
+    thread_registry[name]     = {"fn": fn, "thread": t, "daemon": daemon}
+    thread_last_alive[name]   = time.time()
+    thread_last_alerted[name] = 0
     return t
 
 def heartbeat(name):
     """Call this inside long-running thread loops to signal health"""
     thread_last_alive[name] = time.time()
+
+def stop_thread(name, timeout=10):
+    """Signal a thread to stop and wait for it to exit"""
+    stop_event = thread_stop_events.get(name)
+    if stop_event:
+        stop_event.set()
+    t = thread_registry.get(name, {}).get("thread")
+    if t and t.is_alive():
+        t.join(timeout=timeout)
+        if t.is_alive():
+            print(f"[WATCHDOG] Thread '{name}' did not stop in {timeout}s — forcing restart anyway")
+    print(f"[WATCHDOG] Thread '{name}' stopped")
 
 def watchdog():
     """Monitors all registered threads — restarts any that die"""
@@ -380,37 +487,71 @@ def watchdog():
         try:
             for name, info in list(thread_registry.items()):
                 t = info["thread"]
+                now = time.time()
+
                 if not t.is_alive():
+                    # FIX: Thread is dead — stop cleanly then restart
                     print(f"[WATCHDOG] ⚠️  Thread '{name}' is dead — restarting")
-                    send_telegram(
-                        f"⚠️ <b>WATCHDOG ALERT</b>\n"
-                        f"Thread '{name}' stopped unexpectedly\n"
-                        f"Restarting automatically now",
-                        private=True
-                    )
-                    new_t = threading.Thread(
-                        target=info["fn"],
-                        daemon=info["daemon"],
-                        name=name
-                    )
+                    stop_thread(name)
+                    new_stop = threading.Event()
+                    thread_stop_events[name] = new_stop
+                    try:
+                        new_t = threading.Thread(target=info["fn"], args=(new_stop,),
+                                                 daemon=info["daemon"], name=name)
+                    except TypeError:
+                        new_t = threading.Thread(target=info["fn"],
+                                                 daemon=info["daemon"], name=name)
                     new_t.start()
                     thread_registry[name]["thread"] = new_t
-                    thread_last_alive[name] = time.time()
-                    print(f"[WATCHDOG] ✅ Thread '{name}' restarted")
+                    thread_last_alive[name]         = now
+                    thread_last_alerted[name]       = now
+                    send_telegram(
+                        f"⚠️ <b>WATCHDOG — THREAD RESTARTED</b>\n"
+                        f"Thread: {name} — died and was restarted",
+                        private=True,
+                        dedup_key=f"watchdog_restart_{name}"
+                    )
+                    print(f"[WATCHDOG] ✅ Thread '{name}' restarted cleanly")
+
                 else:
-                    # Check for stale threads (no heartbeat in 10 mins)
-                    last = thread_last_alive.get(name, time.time())
-                    stale_mins = (time.time() - last) / 60
-                    if stale_mins > 10:
-                        print(f"[WATCHDOG] ⚠️  Thread '{name}' stale "
-                              f"({round(stale_mins,1)} mins no heartbeat)")
-                        send_telegram(
-                            f"⚠️ <b>WATCHDOG — STALE THREAD</b>\n"
-                            f"Thread '{name}' has not responded in "
-                            f"{round(stale_mins,1)} minutes\n"
-                            f"Monitor closely",
-                            private=True
-                        )
+                    stale_mins      = (now - thread_last_alive.get(name, now)) / 60
+                    last_alert_mins = (now - thread_last_alerted.get(name, 0)) / 60
+                    # Bot sleeps up to 60 mins — give 75 min before flagging stale
+                    stale_threshold = 75 if name == "bot" else 15
+
+                    if stale_mins > stale_threshold:
+                        if stale_mins > stale_threshold * 2:
+                            # FIX: Stop old thread first, then start new one
+                            print(f"[WATCHDOG] 🔄 '{name}' stale {round(stale_mins,1)}m — restarting")
+                            stop_thread(name)
+                            new_stop = threading.Event()
+                            thread_stop_events[name] = new_stop
+                            try:
+                                new_t = threading.Thread(target=info["fn"], args=(new_stop,),
+                                                         daemon=info["daemon"], name=name)
+                            except TypeError:
+                                new_t = threading.Thread(target=info["fn"],
+                                                         daemon=info["daemon"], name=name)
+                            new_t.start()
+                            thread_registry[name]["thread"] = new_t
+                            thread_last_alive[name]         = now
+                            thread_last_alerted[name]       = now
+                            send_telegram(
+                                f"🔄 <b>WATCHDOG — STALE RESTART</b>\n"
+                                f"Thread: {name} — stale {round(stale_mins,1)}m",
+                                private=True,
+                                dedup_key=f"watchdog_stale_{name}"
+                            )
+                        elif last_alert_mins >= 30:
+                            print(f"[WATCHDOG] ⚠️  '{name}' stale {round(stale_mins,1)}m")
+                            send_telegram(
+                                f"⚠️ <b>WATCHDOG — STALE</b>\n"
+                                f"Thread: {name} | {round(stale_mins,1)} mins no heartbeat",
+                                private=True,
+                                dedup_key=f"watchdog_alert_{name}"
+                            )
+                            thread_last_alerted[name] = now
+
         except Exception as e:
             print(f"[WATCHDOG] Error: {e}")
         time.sleep(60)
@@ -523,13 +664,21 @@ def get_qty_precision(symbol):
         return 3
 
 # ─── TIMING ───────────────────────────────────────────────────────────────────
-def wait_for_candle_close():
+def wait_for_candle_close(stop_event=None):
+    """
+    FIX: Uses stop_event.wait() instead of time.sleep().
+    Wakes immediately if watchdog signals this thread to stop.
+    Prevents duplicate bot instances after watchdog restarts.
+    """
     interval_seconds = int(INTERVAL) * 60
     now          = time.time()
     seconds_left = interval_seconds - (now % interval_seconds)
     sleep_time   = seconds_left + 2
     print(f"[WAIT] Sleeping {round(sleep_time/60, 2)} mins until next candle")
-    time.sleep(sleep_time)
+    if stop_event:
+        stop_event.wait(timeout=sleep_time)  # wakes instantly if stop requested
+    else:
+        time.sleep(sleep_time)
 
 def check_daily_reset():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -592,11 +741,14 @@ def sync_state_from_bybit():
                     side = pos.get("side")
                     sig  = "buy" if side == "Buy" else "sell"
                     last_signal[symbol] = sig
+                    # FIX: Always trust exchange for entry price
+                    # State file may have stale price — exchange is source of truth
+                    exchange_entry = float(pos.get("avgPrice", 0))
                     if symbol not in entry_price:
-                        entry_price[symbol]  = float(pos.get("avgPrice", 0))
-                        peak_profit[symbol]  = 0.0
+                        peak_profit[symbol]   = 0.0
                         locked_profit[symbol] = 0.0
-                        print(f"[SYNC] Restored entry: {entry_price[symbol]}")
+                    entry_price[symbol] = exchange_entry
+                    print(f"[SYNC] Entry price from exchange: {exchange_entry}")
                     print(f"[SYNC] {symbol} → {side} size={size} "
                           f"entry={pos.get('avgPrice')} pnl={pos.get('unrealisedPnl')}")
                     found = True
@@ -1013,11 +1165,13 @@ def place_order(symbol, signal, highs=None, lows=None, closes=None):
     precision  = get_qty_precision(symbol)
     trade_usdt = get_dynamic_trade_usdt(symbol, highs, lows, closes) \
                  if (ENABLE_DYNAMIC_SIZING and highs) else get_trade_usdt(symbol)
-    qty  = round((trade_usdt * get_leverage(symbol)) / price, precision)
-    side = "Buy" if signal == "buy" else "Sell"
+    qty           = round((trade_usdt * get_leverage(symbol)) / price, precision)
+    side          = "Buy" if signal == "buy" else "Sell"
+    order_link_id = f"gkc_{symbol}_{int(time.time())}"  # FIX: unique ID prevents duplicate orders
     body = {"category": "linear", "symbol": symbol,
             "side": side, "orderType": "Market",
-            "qty": str(qty), "timeInForce": "GTC"}
+            "qty": str(qty), "timeInForce": "GTC",
+            "orderLinkId": order_link_id}
     result = safe_request("POST", f"{BASE_URL_PRIVATE}/v5/order/create",
                           headers=sign_post(body), json_body=body)
     if not result:
@@ -1056,9 +1210,13 @@ def send_signal_only_alert(symbol, signal, price):
     )
 
 # ─── REAL-TIME MONITOR ────────────────────────────────────────────────────────
-def realtime_retrace_monitor():
+def realtime_retrace_monitor(stop_event=None):
+    """stop_event: threading.Event — set by watchdog to interrupt cleanly"""
     print("[MONITOR] Real-time monitor started — checking every 45s")
     while True:
+        if stop_event and stop_event.is_set():
+            print("[MONITOR] Stop event received — exiting loop")
+            break
         heartbeat("monitor")
         try:
             mode = get_mode()
@@ -1082,7 +1240,8 @@ def realtime_retrace_monitor():
                             send_telegram(
                                 f"📉 <b>RETRACE EXIT</b>\n"
                                 f"{symbol} | Peak: {round(peak_profit.get(symbol,0),2)}%\n"
-                                f"Lock floor: {round(locked_profit.get(symbol,0),2)}%"
+                                f"Lock floor: {round(locked_profit.get(symbol,0),2)}%",
+                                dedup_key=f"retrace_{symbol}"
                             )
                             close_position(symbol, reason="retrace")
                             last_signal.pop(symbol, None)
@@ -1091,10 +1250,14 @@ def realtime_retrace_monitor():
         except Exception as e:
             print(f"[MONITOR] Error: {e}")
             traceback.print_exc()
-        time.sleep(45)
+        if stop_event:
+            stop_event.wait(timeout=45)
+        else:
+            time.sleep(45)
 
 # ─── BOT LOOP ─────────────────────────────────────────────────────────────────
-def run_bot():
+def run_bot(stop_event=None):
+    """stop_event: threading.Event — set by watchdog to interrupt cleanly"""
     print("=" * 62)
     print("  GKC BOT — VERSION 2.2  |  Production Ready")
     print("  Built by Hazak | @cryptoedgelab | Base by GK")
@@ -1118,19 +1281,52 @@ def run_bot():
     print(f"    Volume Filter:    {'ON' if ENABLE_VOLUME_FILTER     else 'OFF'}")
     print(f"    Time Filter:      {'ON' if ENABLE_TIME_FILTER       else 'OFF'}")
     print("  V2.2 CORE:")
-    print("    ✅ Async Telegram queue")
+    print("    ✅ Async Telegram queue (maxsize=500 + dedup)")
     print("    ✅ Safe request wrapper + backoff")
-    print("    ✅ Persistent JSON state")
-    print("    ✅ Health watchdog")
+    print("    ✅ Persistent JSON state + exec ID rebuild")
+    print("    ✅ Health watchdog (stop events — no duplicate threads)")
+    print("    ✅ orderLinkId (no duplicate orders)")
+    print("    ✅ Protected endpoints + minimal public root")
     print("=" * 62)
+
+    # Warn if no secret token — don't crash, just alert
+    if not BOT_SECRET_TOKEN:
+        print("⚠️  WARNING: BOT_SECRET_TOKEN not set — control endpoints are public")
+        send_telegram(
+            "⚠️ <b>SECURITY WARNING</b>\n"
+            "BOT_SECRET_TOKEN is not set\n"
+            "Control endpoints are publicly accessible\n"
+            "Set BOT_SECRET_TOKEN in Railway env vars",
+            private=True
+        )
+
+    # Startup API key validation
+    if not API_KEY or not API_SECRET:
+        print("❌ FATAL: BYBIT_API_KEY or BYBIT_API_SECRET not set — cannot trade")
+        send_telegram(
+            "❌ <b>STARTUP FAILED</b>\n"
+            "BYBIT_API_KEY or BYBIT_API_SECRET missing\n"
+            "Bot cannot start — set env vars on Railway",
+            private=True
+        )
+        return
+
     init_log()
     load_state()
+    rebuild_exec_ids()  # FIX: rebuild exec IDs before sync to prevent double-counting
     sync_state_from_bybit()
 
     while True:
         try:
             heartbeat("bot")
-            wait_for_candle_close()
+            # FIX: pass stop_event so watchdog can interrupt the sleep
+            if stop_event and stop_event.is_set():
+                print("[BOT] Stop event received — exiting loop")
+                break
+            wait_for_candle_close(stop_event)
+            if stop_event and stop_event.is_set():
+                print("[BOT] Stop event received after wait — exiting loop")
+                break
             check_daily_reset()
             clear_scan_cache()
 
@@ -1200,6 +1396,16 @@ def run_bot():
                                 last_signal.pop(symbol, None)
 
                             # ── Entry filters — NEW entries only ──
+
+                            # Per-symbol daily profit target — only blocks NEW entries
+                            # Existing positions keep running — never misses a big move
+                            if DAILY_PROFIT_TARGET > 0:
+                                sym_pnl = SYMBOL_DAILY_PNL.get(symbol, 0)
+                                if sym_pnl >= DAILY_PROFIT_TARGET:
+                                    print(f"[PROFIT TARGET] {symbol} hit ${sym_pnl} "
+                                          f"today — skipping new entry, letting winners run")
+                                    continue
+
                             if not time_allows_entry(symbol):          continue
                             if highs and not atr_filter_passes(symbol, highs, lows, closes): continue
                             if closes and not volatility_filter_passes(symbol, closes):       continue
@@ -1208,10 +1414,17 @@ def run_bot():
                             if closes and not lsma_macro_confirms(symbol, closes, signal):   continue
                             if not dual_tf_allows_new_entry(symbol, signal):                 continue
 
+                            # Max open positions check
+                            open_count = len([s for s in SYMBOLS if s in last_signal])
+                            if open_count >= MAX_OPEN_POSITIONS:
+                                print(f"[MAX POS] Already {open_count} positions open — skipping {symbol}")
+                                continue
+
                             print(f"[ORDER] {symbol} {signal.upper()} — all filters passed")
                             place_order(symbol, signal, highs, lows, closes)
                             last_signal[symbol] = signal
                             bot_status["last_signal"] = last_signal.copy()
+                            save_state()  # FIX: persist signal state immediately
 
                         elif mode == "signal_only":
                             price = get_price(symbol) or 0
@@ -1228,9 +1441,39 @@ def run_bot():
             traceback.print_exc()
             time.sleep(30)
 
+# ─── ROUTE AUTHENTICATION ─────────────────────────────────────────────────────
+# All control endpoints require ?token=BOT_SECRET_TOKEN
+# Read-only endpoints (/, /status, /test, /performance) are public
+from flask import request as flask_request
+
+def auth_required():
+    """Returns True if request is authenticated"""
+    if not BOT_SECRET_TOKEN:
+        return True  # if no token set, allow all (dev mode)
+    token = flask_request.args.get("token") or \
+            flask_request.headers.get("Authorization", "").replace("Bearer ", "")
+    return token == BOT_SECRET_TOKEN
+
+def auth_error():
+    return jsonify({"error": "Unauthorized — provide ?token=YOUR_SECRET"}), 401
+
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
+    """Public endpoint — minimal info only. Full dashboard requires token."""
+    return jsonify({
+        "status":      "running",
+        "version":     "2.2",
+        "mode":        get_mode(),
+        "last_scan":   bot_status.get("last_scan", "never"),
+        "symbols":     SYMBOLS,
+        "interval":    f"{INTERVAL}m",
+    })
+
+@app.route("/dashboard")
+def dashboard():
+    """Full dashboard — requires auth token"""
+    if not auth_required(): return auth_error()
     return jsonify({
         "version":     "2.2",
         "status":      "running",
@@ -1321,12 +1564,14 @@ def perf():
 
 @app.route("/trading")
 def mode_trading():
+    if not auth_required(): return auth_error()
     set_mode("trading")
     send_telegram("⚡ <b>BOT MODE: TRADING</b>\nV2.2 — signals + orders active", private=True)
     return jsonify({"mode": "trading", "version": "2.2"})
 
 @app.route("/signalonly")
 def mode_signal_only():
+    if not auth_required(): return auth_error()
     if get_mode() == "trading" and last_signal:
         close_all_positions()
         send_telegram("📡 <b>SIGNAL ONLY</b>\nAll positions closed first", private=True)
@@ -1337,12 +1582,14 @@ def mode_signal_only():
 
 @app.route("/pause")
 def mode_pause():
+    if not auth_required(): return auth_error()
     set_mode("paused")
     send_telegram("⏸️ <b>BOT PAUSED</b>\nNo signals, no orders", private=True)
     return jsonify({"mode": "paused"})
 
 @app.route("/pause/<symbol>")
 def pause_symbol(symbol):
+    if not auth_required(): return auth_error()
     sym = symbol.upper()
     if sym not in SYMBOL_CONFIG:
         return jsonify({"error": f"{sym} not found"})
@@ -1351,6 +1598,7 @@ def pause_symbol(symbol):
 
 @app.route("/resume/<symbol>")
 def resume_symbol(symbol):
+    if not auth_required(): return auth_error()
     sym = symbol.upper()
     if sym not in SYMBOL_CONFIG:
         return jsonify({"error": f"{sym} not found"})
@@ -1361,6 +1609,7 @@ def resume_symbol(symbol):
 
 @app.route("/sync")
 def sync():
+    if not auth_required(): return auth_error()
     try:
         sync_state_from_bybit()
         return jsonify({"message": "Synced", "last_signal": last_signal})
@@ -1369,6 +1618,7 @@ def sync():
 
 @app.route("/closeall")
 def closeall():
+    if not auth_required(): return auth_error()
     try:
         close_all_positions()
         return jsonify({"message": "All positions closed"})
@@ -1377,6 +1627,7 @@ def closeall():
 
 @app.route("/savestate")
 def savestate():
+    if not auth_required(): return auth_error()
     try:
         save_state()
         return jsonify({"message": "State saved", "file": STATE_FILE})
@@ -1385,6 +1636,7 @@ def savestate():
 
 @app.route("/debug")
 def debug():
+    if not auth_required(): return auth_error()
     try:
         results = {}
         for symbol in SYMBOLS:
@@ -1413,6 +1665,7 @@ def test():
 
 @app.route("/reset_warning/<symbol>")
 def reset_warning(symbol):
+    if not auth_required(): return auth_error()
     early_warning_fired.discard(symbol.upper())
     return jsonify({"message": f"Early warning reset for {symbol.upper()}"})
 
