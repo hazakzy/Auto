@@ -164,7 +164,7 @@ telegram_queue    = queue.Queue(maxsize=500)
 telegram_last_sent = {}   # dedup cache — {message_key: timestamp}
 TELEGRAM_DEDUP_SECS = 60  # suppress identical messages within 60s
 
-def telegram_worker():
+def telegram_worker(stop_event=None):
     """Background thread — drains the Telegram queue and sends messages"""
     print("[TELEGRAM] Queue worker started")
     last_cleanup = time.time()
