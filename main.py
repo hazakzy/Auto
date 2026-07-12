@@ -88,11 +88,11 @@ ENABLE_LSMA_FILTER       = False
 ENABLE_VOLATILITY_FILTER = False
 
 # ── V2.1 flags ──
-ENABLE_ATR_FILTER        = True
-ENABLE_CONSECUTIVE_LOSS  = True
+ENABLE_ATR_FILTER        = False
+ENABLE_CONSECUTIVE_LOSS  = False
 ENABLE_DYNAMIC_SIZING    = False
-ENABLE_MARKET_REGIME     = True
-ENABLE_PROFIT_LOCKING    = True
+ENABLE_MARKET_REGIME     = False
+ENABLE_PROFIT_LOCKING    = False
 ENABLE_VOLUME_FILTER     = False
 ENABLE_TIME_FILTER       = False
 
@@ -431,11 +431,17 @@ def rebuild_exec_ids():
     except Exception as e:
         print(f"[STATE] rebuild_exec_ids error: {e}")
 
-def state_persistence_worker():
+def state_persistence_worker(stop_event=None):
     """Background thread — saves state every 60 seconds"""
     print("[STATE] Persistence worker started — saving every 60s")
     while True:
-        time.sleep(60)
+        if stop_event:
+            stop_event.wait(timeout=60)
+            if stop_event.is_set():
+                print("[STATE] Stop event received — exiting")
+                break
+        else:
+            time.sleep(60)
         save_state()
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -449,14 +455,12 @@ thread_last_alerted  = {}   # prevents spam — track last alert time per thread
 thread_stop_events   = {}   # FIX: stop events so old threads exit before new ones start
 
 def register_thread(name, fn, daemon=True):
-    """Create, register and start a thread with a stop event"""
+    """Create, register and start a thread with a stop event.
+    All worker functions must accept stop_event=None as first arg."""
     stop_event = threading.Event()
     thread_stop_events[name] = stop_event
-    # Pass stop_event to functions that accept it (bot, monitor)
-    try:
-        t = threading.Thread(target=fn, args=(stop_event,), daemon=daemon, name=name)
-    except TypeError:
-        t = threading.Thread(target=fn, daemon=daemon, name=name)
+    # All workers accept stop_event=None — no try/except needed
+    t = threading.Thread(target=fn, args=(stop_event,), daemon=daemon, name=name)
     t.start()
     thread_registry[name]     = {"fn": fn, "thread": t, "daemon": daemon}
     thread_last_alive[name]   = time.time()
@@ -495,12 +499,8 @@ def watchdog():
                     stop_thread(name)
                     new_stop = threading.Event()
                     thread_stop_events[name] = new_stop
-                    try:
-                        new_t = threading.Thread(target=info["fn"], args=(new_stop,),
-                                                 daemon=info["daemon"], name=name)
-                    except TypeError:
-                        new_t = threading.Thread(target=info["fn"],
-                                                 daemon=info["daemon"], name=name)
+                    new_t = threading.Thread(target=info["fn"], args=(new_stop,),
+                                             daemon=info["daemon"], name=name)
                     new_t.start()
                     thread_registry[name]["thread"] = new_t
                     thread_last_alive[name]         = now
@@ -516,22 +516,16 @@ def watchdog():
                 else:
                     stale_mins      = (now - thread_last_alive.get(name, now)) / 60
                     last_alert_mins = (now - thread_last_alerted.get(name, 0)) / 60
-                    # Bot sleeps up to 60 mins — give 75 min before flagging stale
                     stale_threshold = 75 if name == "bot" else 15
 
                     if stale_mins > stale_threshold:
                         if stale_mins > stale_threshold * 2:
-                            # FIX: Stop old thread first, then start new one
                             print(f"[WATCHDOG] 🔄 '{name}' stale {round(stale_mins,1)}m — restarting")
                             stop_thread(name)
                             new_stop = threading.Event()
                             thread_stop_events[name] = new_stop
-                            try:
-                                new_t = threading.Thread(target=info["fn"], args=(new_stop,),
-                                                         daemon=info["daemon"], name=name)
-                            except TypeError:
-                                new_t = threading.Thread(target=info["fn"],
-                                                         daemon=info["daemon"], name=name)
+                            new_t = threading.Thread(target=info["fn"], args=(new_stop,),
+                                                     daemon=info["daemon"], name=name)
                             new_t.start()
                             thread_registry[name]["thread"] = new_t
                             thread_last_alive[name]         = now
