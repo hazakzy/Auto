@@ -169,6 +169,7 @@ def telegram_worker(stop_event=None):
     print("[TELEGRAM] Queue worker started")
     last_cleanup = time.time()
     while True:
+        heartbeat("telegram")  # signal watchdog telegram thread is alive
         # FIX: periodic cleanup of dedup cache to prevent memory growth
         if time.time() - last_cleanup > 300:  # every 5 minutes
             now = time.time()
@@ -437,6 +438,7 @@ def state_persistence_worker(stop_event=None):
     """Background thread — saves state every 60 seconds"""
     print("[STATE] Persistence worker started — saving every 60s")
     while True:
+        heartbeat("state")  # signal watchdog state thread is alive
         if stop_event:
             stop_event.wait(timeout=60)
             if stop_event.is_set():
