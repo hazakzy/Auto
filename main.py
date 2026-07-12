@@ -47,7 +47,7 @@ STATE_FILE          = "/tmp/gkc_state.json"  # persistent state file
 # ── PER-SYMBOL CONFIG ─────────────────────────────────────────────────────────
 SYMBOL_CONFIG = {
     "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False, "paused": False},
-    "HYPEUSDT": {"trade_usdt": 10, "leverage": 10, "early_warning": False, "paused": False},
+    "HYPEUSDT": {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
     "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
     "ETHUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
 }
@@ -69,7 +69,7 @@ INTERVAL  = "60"
 EMA_FAST  = 12
 EMA_SLOW  = 21
 EMA_WARN  = 34
-MAX_DAILY_LOSS          = 25
+MAX_DAILY_LOSS          = 20
 MAX_OPEN_POSITIONS      = 4     # max simultaneous open positions across all symbols
 DAILY_PROFIT_TARGET     = 0.0   # 0 = disabled. Set e.g. 30.0 to stop new entries per symbol at +$30 daily
 SYMBOL_DAILY_PNL        = {s: 0.0 for s in ["BTCUSDT","HYPEUSDT","SOLUSDT","ETHUSDT"]}
@@ -81,7 +81,7 @@ PARTIAL_PCT             = 0.25
 # ╚══════════════════════════════════════════════════════════════════╝
 
 # ── V1 flags ──
-ENABLE_TRADE_LOGGING     = False
+ENABLE_TRADE_LOGGING     = True
 ENABLE_HARD_STOP_LOSS    = True    # fixed in V2.2 — measures leveraged loss
 ENABLE_DUAL_TIMEFRAME    = False
 ENABLE_LSMA_FILTER       = False
@@ -89,10 +89,10 @@ ENABLE_VOLATILITY_FILTER = False
 
 # ── V2.1 flags ──
 ENABLE_ATR_FILTER        = False
-ENABLE_CONSECUTIVE_LOSS  = False
+ENABLE_CONSECUTIVE_LOSS  = True
 ENABLE_DYNAMIC_SIZING    = False
 ENABLE_MARKET_REGIME     = False
-ENABLE_PROFIT_LOCKING    = False
+ENABLE_PROFIT_LOCKING    = True
 ENABLE_VOLUME_FILTER     = False
 ENABLE_TIME_FILTER       = False
 
