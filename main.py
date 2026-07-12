@@ -81,7 +81,7 @@ PARTIAL_PCT             = 0.25
 # ╚══════════════════════════════════════════════════════════════════╝
 
 # ── V1 flags ──
-ENABLE_TRADE_LOGGING     = True
+ENABLE_TRADE_LOGGING     = False
 ENABLE_HARD_STOP_LOSS    = True    # fixed in V2.2 — measures leveraged loss
 ENABLE_DUAL_TIMEFRAME    = False
 ENABLE_LSMA_FILTER       = False
@@ -89,10 +89,10 @@ ENABLE_VOLATILITY_FILTER = False
 
 # ── V2.1 flags ──
 ENABLE_ATR_FILTER        = False
-ENABLE_CONSECUTIVE_LOSS  = True
-ENABLE_DYNAMIC_SIZING    = True
+ENABLE_CONSECUTIVE_LOSS  = False
+ENABLE_DYNAMIC_SIZING    = False
 ENABLE_MARKET_REGIME     = False
-ENABLE_PROFIT_LOCKING    = True
+ENABLE_PROFIT_LOCKING    = False
 ENABLE_VOLUME_FILTER     = False
 ENABLE_TIME_FILTER       = False
 
@@ -1239,7 +1239,8 @@ def realtime_retrace_monitor(stop_event=None):
                     try:
                         if check_hard_stop(symbol):
                             close_position(symbol, reason="hard stop loss")
-                            last_signal.pop(symbol, None)
+                            with state_lock:
+                                last_signal.pop(symbol, None)
                             continue
                         if is_early_warning_on(symbol) and symbol not in early_warning_fired:
                             if check_early_warning(symbol):
@@ -1253,7 +1254,8 @@ def realtime_retrace_monitor(stop_event=None):
                                 dedup_key=f"retrace_{symbol}"
                             )
                             close_position(symbol, reason="retrace")
-                            last_signal.pop(symbol, None)
+                            with state_lock:
+                                last_signal.pop(symbol, None)
                     finally:
                         lock.release()
         except Exception as e:
@@ -1322,8 +1324,9 @@ def run_bot(stop_event=None):
 
     init_log()
     load_state()
-    rebuild_exec_ids()  # FIX: rebuild exec IDs before sync to prevent double-counting
+    rebuild_exec_ids()
     sync_state_from_bybit()
+    consecutive_failures = 0   # FIX: track repeated failures — break after 10
 
     while True:
         try:
@@ -1366,90 +1369,113 @@ def run_bot(stop_event=None):
                 close_all_positions()
                 continue
 
-            sync_state_from_bybit()
-
             for symbol in SYMBOLS:
                 heartbeat("bot")  # signal watchdog bot is alive during slow scans
-                if is_symbol_paused(symbol):
-                    print(f"[PAUSED] {symbol} — skipping")
-                    continue
-
-                lock = symbol_locks.get(symbol)
-                if not lock:
-                    continue
-
-                with lock:
-                    # V2.1 — consecutive loss cooldown
-                    if check_consecutive_loss_limit(symbol):
-                        print(f"[COOLDOWN] {symbol} — skipping")
+                # FIX: per-symbol try/except — one symbol failing never stops others
+                try:
+                    if is_symbol_paused(symbol):
+                        print(f"[PAUSED] {symbol} — skipping")
                         continue
 
-                    # Retrace at candle close (backup for monitor)
-                    if mode == "trading" and symbol in last_signal:
-                        if check_peak_retrace(symbol):
-                            print(f"[RETRACE] {symbol} — closing at candle")
-                            close_position(symbol, reason="retrace at candle")
-                            last_signal.pop(symbol, None)
+                    lock = symbol_locks.get(symbol)
+                    if not lock:
+                        continue
+
+                    with lock:
+                        # V2.1 — consecutive loss cooldown
+                        if check_consecutive_loss_limit(symbol):
+                            print(f"[COOLDOWN] {symbol} — skipping")
                             continue
 
-                    signal, highs, lows, closes, volumes = check_signal(symbol)
-                    prev = last_signal.get(symbol)
-                    print(f"[SIGNAL] {symbol} | current={signal} | prev={prev} | mode={mode}")
-
-                    if signal and signal != prev:
-
-                        if mode == "trading":
-                            # Always close existing position first — never filtered
-                            if prev and symbol in entry_price:
-                                print(f"[EXIT] {symbol} closing {prev} on flip")
-                                close_position(symbol, reason="signal flip")
-                                last_signal.pop(symbol, None)
-
-                            # ── Entry filters — NEW entries only ──
-
-                            # Per-symbol daily profit target — only blocks NEW entries
-                            # Existing positions keep running — never misses a big move
-                            if DAILY_PROFIT_TARGET > 0:
-                                sym_pnl = SYMBOL_DAILY_PNL.get(symbol, 0)
-                                if sym_pnl >= DAILY_PROFIT_TARGET:
-                                    print(f"[PROFIT TARGET] {symbol} hit ${sym_pnl} "
-                                          f"today — skipping new entry, letting winners run")
-                                    continue
-
-                            if not time_allows_entry(symbol):          continue
-                            if highs and not atr_filter_passes(symbol, highs, lows, closes): continue
-                            if closes and not volatility_filter_passes(symbol, closes):       continue
-                            if highs and not market_is_trending(symbol, highs, lows, closes): continue
-                            if volumes and not volume_confirms(symbol, volumes):              continue
-                            if closes and not lsma_macro_confirms(symbol, closes, signal):   continue
-                            if not dual_tf_allows_new_entry(symbol, signal):                 continue
-
-                            # Max open positions check
-                            open_count = len([s for s in SYMBOLS if s in last_signal])
-                            if open_count >= MAX_OPEN_POSITIONS:
-                                print(f"[MAX POS] Already {open_count} positions open — skipping {symbol}")
+                        # Retrace at candle close (backup for monitor)
+                        if mode == "trading" and symbol in last_signal:
+                            if check_peak_retrace(symbol):
+                                print(f"[RETRACE] {symbol} — closing at candle")
+                                close_position(symbol, reason="retrace at candle")
+                                with state_lock:
+                                    last_signal.pop(symbol, None)
                                 continue
 
-                            print(f"[ORDER] {symbol} {signal.upper()} — all filters passed")
-                            place_order(symbol, signal, highs, lows, closes)
-                            last_signal[symbol] = signal
-                            bot_status["last_signal"] = last_signal.copy()
-                            save_state()  # FIX: persist signal state immediately
+                        signal, highs, lows, closes, volumes = check_signal(symbol)
+                        prev = last_signal.get(symbol)
+                        print(f"[SIGNAL] {symbol} | current={signal} | prev={prev} | mode={mode}")
 
-                        elif mode == "signal_only":
-                            price = get_price(symbol) or 0
-                            send_signal_only_alert(symbol, signal, price)
-                            last_signal[symbol] = signal
-                            bot_status["last_signal"] = last_signal.copy()
+                        if signal and signal != prev:
 
-                    else:
-                        print(f"[HOLD] {symbol} | no confirmed reversal")
+                            if mode == "trading":
+                                # Always close existing position first — never filtered
+                                if prev and symbol in entry_price:
+                                    print(f"[EXIT] {symbol} closing {prev} on flip")
+                                    close_position(symbol, reason="signal flip")
+                                    with state_lock:
+                                        last_signal.pop(symbol, None)
+
+                                # ── Entry filters — NEW entries only ──
+                                if DAILY_PROFIT_TARGET > 0:
+                                    sym_pnl = SYMBOL_DAILY_PNL.get(symbol, 0)
+                                    if sym_pnl >= DAILY_PROFIT_TARGET:
+                                        print(f"[PROFIT TARGET] {symbol} — skipping new entry")
+                                        continue
+
+                                if not time_allows_entry(symbol):                              continue
+                                if highs and not atr_filter_passes(symbol, highs, lows, closes): continue
+                                if closes and not volatility_filter_passes(symbol, closes):       continue
+                                if highs and not market_is_trending(symbol, highs, lows, closes): continue
+                                if volumes and not volume_confirms(symbol, volumes):              continue
+                                if closes and not lsma_macro_confirms(symbol, closes, signal):   continue
+                                if not dual_tf_allows_new_entry(symbol, signal):                 continue
+
+                                open_count = len([s for s in SYMBOLS if s in last_signal])
+                                if open_count >= MAX_OPEN_POSITIONS:
+                                    print(f"[MAX POS] {open_count} open — skipping {symbol}")
+                                    continue
+
+                                print(f"[ORDER] {symbol} {signal.upper()} — all filters passed")
+                                place_order(symbol, signal, highs, lows, closes)
+                                with state_lock:
+                                    last_signal[symbol] = signal
+                                bot_status["last_signal"] = dict(last_signal)
+                                save_state()
+
+                            elif mode == "signal_only":
+                                price = get_price(symbol) or 0
+                                send_signal_only_alert(symbol, signal, price)
+                                with state_lock:
+                                    last_signal[symbol] = signal
+                                bot_status["last_signal"] = dict(last_signal)
+
+                        else:
+                            print(f"[HOLD] {symbol} | no confirmed reversal")
+
+                except Exception as sym_err:
+                    print(f"[ERROR] {symbol} scan failed: {sym_err}")
+                    traceback.print_exc()
+                    send_telegram(
+                        f"⚠️ <b>SYMBOL ERROR</b>\n"
+                        f"{symbol}: {str(sym_err)[:100]}\n"
+                        f"Skipping — other symbols continue",
+                        private=True,
+                        dedup_key=f"sym_error_{symbol}"
+                    )
 
         except Exception as e:
             bot_status["error"] = str(e)
             print(f"[ERROR] Bot loop: {e}")
             traceback.print_exc()
+            consecutive_failures += 1
+            if consecutive_failures >= 10:
+                msg = (
+                    f"🚨 <b>BOT STOPPED</b>\n"
+                    f"10 consecutive failures\n"
+                    f"Last error: {str(e)[:100]}\n"
+                    f"Railway will restart automatically"
+                )
+                send_telegram(msg, private=True)
+                print("[FATAL] 10 consecutive failures — stopping bot loop")
+                break
             time.sleep(30)
+        else:
+            consecutive_failures = 0  # reset on successful scan
 
 # ─── ROUTE AUTHENTICATION ─────────────────────────────────────────────────────
 # All control endpoints require ?token=BOT_SECRET_TOKEN
@@ -1485,15 +1511,15 @@ def dashboard():
     """Full dashboard — requires auth token"""
     if not auth_required(): return auth_error()
     return jsonify({
-        "version":     "2.2",
-        "status":      "running",
-        "mode":        get_mode(),
-        "bot":         bot_status,
-        "last_signal": last_signal,
-        "entry_price": entry_price,
-        "peak_profit": peak_profit,
-        "locked_profit": locked_profit,
-        "daily_pnl":   daily_pnl,
+        "version":       "2.2",
+        "status":        "running",
+        "mode":          get_mode(),
+        "bot":           dict(bot_status),
+        "last_signal":   dict(last_signal),
+        "entry_price":   dict(entry_price),
+        "peak_profit":   dict(peak_profit),
+        "locked_profit": dict(locked_profit),
+        "daily_pnl":     dict(daily_pnl),
         "symbols": {
             s: {
                 **cfg,
@@ -1556,9 +1582,9 @@ def status():
             "version":        "2.2",
             "mode":           get_mode(),
             "open_positions": positions,
-            "last_signal":    last_signal,
-            "last_scan":      bot_status["last_scan"],
-            "daily_pnl":      daily_pnl,
+            "last_signal":    dict(last_signal),
+            "last_scan":      bot_status.get("last_scan", "never"),
+            "daily_pnl":      dict(daily_pnl),
         })
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -1604,6 +1630,7 @@ def pause_symbol(symbol):
     if sym not in SYMBOL_CONFIG:
         return jsonify({"error": f"{sym} not found"})
     SYMBOL_CONFIG[sym]["paused"] = True
+    save_state()
     return jsonify({"message": f"{sym} paused"})
 
 @app.route("/resume/<symbol>")
@@ -1615,6 +1642,7 @@ def resume_symbol(symbol):
     SYMBOL_CONFIG[sym]["paused"] = False
     cooldown_candles[sym]        = 0
     consecutive_losses[sym]      = 0
+    save_state()
     return jsonify({"message": f"{sym} resumed"})
 
 @app.route("/sync")
