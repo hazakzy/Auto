@@ -832,26 +832,49 @@ def atr_filter_passes(symbol, highs, lows, closes):
 def check_consecutive_loss_limit(symbol):
     if not ENABLE_CONSECUTIVE_LOSS:
         return False
+
     if cooldown_candles.get(symbol, 0) > 0:
         cooldown_candles[symbol] -= 1
         remaining = cooldown_candles[symbol]
+
+        # FIX: even on cooldown — if signal flipped, close existing position
+        signal = last_signal.get(symbol)
+        if signal and symbol in entry_price:
+            # check if EMA has crossed against current position
+            _, _, closes, _ = get_candles(symbol)  
+            if len(closes) >= EMA_SLOW + 5:
+                fast = calc_ema(closes, EMA_FAST)
+                slow = calc_ema(closes, EMA_SLOW)
+                should_close = (
+                    (signal == "buy"  and fast < slow) or
+                    (signal == "sell" and fast > slow)
+                )
+                if should_close:
+                    print(f"[COOLDOWN] {symbol} — signal flipped during cooldown — closing position")
+                    close_position(symbol, reason="signal flip during cooldown")
+                    with state_lock:
+                        last_signal.pop(symbol, None)
+
         if remaining == 0:
             SYMBOL_CONFIG[symbol]["paused_by_loss"] = False
             send_telegram(f"✅ <b>{symbol} RESUMED</b>\nCooldown complete", private=True)
-        return True
+        return True  # still skip new entry
+
     losses = consecutive_losses.get(symbol, 0)
     if losses >= MAX_CONSECUTIVE_LOSSES:
-        cooldown_candles[symbol]          = COOLDOWN_CANDLES
+        cooldown_candles[symbol] = COOLDOWN_CANDLES
         SYMBOL_CONFIG[symbol]["paused_by_loss"] = True
-        consecutive_losses[symbol]        = 0
+        consecutive_losses[symbol] = 0
         send_telegram(
             f"⏸️ <b>{symbol} COOLDOWN</b>\n"
             f"{MAX_CONSECUTIVE_LOSSES} consecutive losses\n"
-            f"Pausing {COOLDOWN_CANDLES} candles",
+            f"Pausing {COOLDOWN_CANDLES} candles — exits still active",
             private=True
         )
         return True
+
     return False
+
 
 def get_dynamic_trade_usdt(symbol, highs, lows, closes):
     base = get_trade_usdt(symbol)
