@@ -47,7 +47,7 @@ STATE_FILE          = "/tmp/gkc_state.json"  # persistent state file
 # ── PER-SYMBOL CONFIG ─────────────────────────────────────────────────────────
 SYMBOL_CONFIG = {
     "BTCUSDT":  {"trade_usdt": 20, "leverage": 10, "early_warning": False, "paused": False},
-    "HYPEUSDT": {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
+    "HYPEUSDT": {"trade_usdt": 10, "leverage": 10, "early_warning": False, "paused": False},
     "SOLUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
     "ETHUSDT":  {"trade_usdt": 15, "leverage": 10, "early_warning": False, "paused": False},
 }
@@ -69,8 +69,24 @@ INTERVAL  = "60"
 EMA_FAST  = 12
 EMA_SLOW  = 21
 EMA_WARN  = 34
-MAX_DAILY_LOSS          = 20
-MAX_OPEN_POSITIONS      = 4     # max simultaneous open positions across all symbols
+MAX_DAILY_LOSS          = 25
+MAX_OPEN_POSITIONS      = 4
+
+# ── Community Signal TP/SL levels (price % — not leveraged) ──────────────────
+# These appear in the public Telegram signal — they do NOT affect bot exits
+# Bot's own exits are handled by retrace, profit lock and hard stop independently
+SIGNAL_TP_LEVELS = {
+    "BTCUSDT":  [1.0, 2.0, 3.0],   # tight — BTC moves slowly on 60m
+    "HYPEUSDT": [3.0, 5.0, 8.0],   # wide  — HYPE is explosive
+    "SOLUSDT":  [2.0, 3.5, 5.0],   # medium
+    "ETHUSDT":  [1.5, 2.5, 4.0],   # medium
+}
+SIGNAL_SL_PCT = {
+    "BTCUSDT":  2.0,   # 2% price = 20% leveraged loss at 10x
+    "HYPEUSDT": 4.0,   # wider — HYPE is volatile
+    "SOLUSDT":  3.0,
+    "ETHUSDT":  2.5,
+}     # max simultaneous open positions across all symbols
 DAILY_PROFIT_TARGET     = 0.0   # 0 = disabled. Set e.g. 30.0 to stop new entries per symbol at +$30 daily
 SYMBOL_DAILY_PNL        = {s: 0.0 for s in ["BTCUSDT","HYPEUSDT","SOLUSDT","ETHUSDT"]}
 PARTIAL_PCT             = 0.25
@@ -81,7 +97,7 @@ PARTIAL_PCT             = 0.25
 # ╚══════════════════════════════════════════════════════════════════╝
 
 # ── V1 flags ──
-ENABLE_TRADE_LOGGING     = True
+ENABLE_TRADE_LOGGING     = False
 ENABLE_HARD_STOP_LOSS    = True    # fixed in V2.2 — measures leveraged loss
 ENABLE_DUAL_TIMEFRAME    = False
 ENABLE_LSMA_FILTER       = False
@@ -89,10 +105,10 @@ ENABLE_VOLATILITY_FILTER = False
 
 # ── V2.1 flags ──
 ENABLE_ATR_FILTER        = False
-ENABLE_CONSECUTIVE_LOSS  = True
+ENABLE_CONSECUTIVE_LOSS  = False
 ENABLE_DYNAMIC_SIZING    = False
 ENABLE_MARKET_REGIME     = False
-ENABLE_PROFIT_LOCKING    = True
+ENABLE_PROFIT_LOCKING    = False
 ENABLE_VOLUME_FILTER     = False
 ENABLE_TIME_FILTER       = False
 
@@ -832,49 +848,26 @@ def atr_filter_passes(symbol, highs, lows, closes):
 def check_consecutive_loss_limit(symbol):
     if not ENABLE_CONSECUTIVE_LOSS:
         return False
-
     if cooldown_candles.get(symbol, 0) > 0:
         cooldown_candles[symbol] -= 1
         remaining = cooldown_candles[symbol]
-
-        # FIX: even on cooldown — if signal flipped, close existing position
-        signal = last_signal.get(symbol)
-        if signal and symbol in entry_price:
-            # check if EMA has crossed against current position
-            _, _, closes, _ = get_candles(symbol)  
-            if len(closes) >= EMA_SLOW + 5:
-                fast = calc_ema(closes, EMA_FAST)
-                slow = calc_ema(closes, EMA_SLOW)
-                should_close = (
-                    (signal == "buy"  and fast < slow) or
-                    (signal == "sell" and fast > slow)
-                )
-                if should_close:
-                    print(f"[COOLDOWN] {symbol} — signal flipped during cooldown — closing position")
-                    close_position(symbol, reason="signal flip during cooldown")
-                    with state_lock:
-                        last_signal.pop(symbol, None)
-
         if remaining == 0:
             SYMBOL_CONFIG[symbol]["paused_by_loss"] = False
             send_telegram(f"✅ <b>{symbol} RESUMED</b>\nCooldown complete", private=True)
-        return True  # still skip new entry
-
+        return True
     losses = consecutive_losses.get(symbol, 0)
     if losses >= MAX_CONSECUTIVE_LOSSES:
-        cooldown_candles[symbol] = COOLDOWN_CANDLES
+        cooldown_candles[symbol]          = COOLDOWN_CANDLES
         SYMBOL_CONFIG[symbol]["paused_by_loss"] = True
-        consecutive_losses[symbol] = 0
+        consecutive_losses[symbol]        = 0
         send_telegram(
             f"⏸️ <b>{symbol} COOLDOWN</b>\n"
             f"{MAX_CONSECUTIVE_LOSSES} consecutive losses\n"
-            f"Pausing {COOLDOWN_CANDLES} candles — exits still active",
+            f"Pausing {COOLDOWN_CANDLES} candles",
             private=True
         )
         return True
-
     return False
-
 
 def get_dynamic_trade_usdt(symbol, highs, lows, closes):
     base = get_trade_usdt(symbol)
@@ -1220,11 +1213,45 @@ def place_order(symbol, signal, highs=None, lows=None, closes=None):
         early_signal_alerted.pop(symbol, None)
         log_trade(symbol, "ENTRY", side, actual_entry, qty, reason="EMA crossover")
         save_state()
+
+        # ── Private alert for you — full details ──
         send_telegram(
-            f"🟢 <b>NEW TRADE</b>\n"
+            f"🟢 <b>NEW TRADE (PRIVATE)</b>\n"
             f"Symbol: {symbol}\n"
             f"Side: {side} | Entry: ${actual_entry}\n"
-            f"Daily PnL: ${round(daily_pnl['pnl'],2)}"
+            f"Daily PnL: ${round(daily_pnl['pnl'],2)}",
+            private=True
+        )
+
+        # ── Community signal alert — Entry, SL, TPs ──
+        # These are for the community only — bot's own exits are unaffected
+        tp_pcts = SIGNAL_TP_LEVELS.get(symbol, [1.0, 2.0, 3.0])
+        sl_pct  = SIGNAL_SL_PCT.get(symbol, 2.0)
+
+        if signal == "buy":
+            sl    = round(actual_entry * (1 - sl_pct / 100), 4)
+            tp1   = round(actual_entry * (1 + tp_pcts[0] / 100), 4)
+            tp2   = round(actual_entry * (1 + tp_pcts[1] / 100), 4)
+            tp3   = round(actual_entry * (1 + tp_pcts[2] / 100), 4)
+            arrow = "🟢 LONG"
+        else:
+            sl    = round(actual_entry * (1 + sl_pct / 100), 4)
+            tp1   = round(actual_entry * (1 - tp_pcts[0] / 100), 4)
+            tp2   = round(actual_entry * (1 - tp_pcts[1] / 100), 4)
+            tp3   = round(actual_entry * (1 - tp_pcts[2] / 100), 4)
+            arrow = "🔴 SHORT"
+
+        send_telegram(
+            f"📡 <b>SIGNAL ALERT</b>\n\n"
+            f"Pair: {symbol} {arrow}\n"
+            f"Entry: ${actual_entry}\n"
+            f"Stop Loss: ${sl} (-{sl_pct}%)\n\n"
+            f"🎯 Targets:\n"
+            f"TP1: ${tp1} (+{tp_pcts[0]}%)\n"
+            f"TP2: ${tp2} (+{tp_pcts[1]}%)\n"
+            f"TP3: ${tp3} (+{tp_pcts[2]}%)\n\n"
+            f"⚡ CryproEdge GKC Signal\n"
+            f"@cryptoedgelab"
         )
 
 def close_all_positions():
