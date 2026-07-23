@@ -97,7 +97,7 @@ PARTIAL_PCT             = 0.25
 # ╚══════════════════════════════════════════════════════════════════╝
 
 # ── V1 flags ──
-ENABLE_TRADE_LOGGING     = False
+ENABLE_TRADE_LOGGING     = True
 ENABLE_HARD_STOP_LOSS    = True    # fixed in V2.2 — measures leveraged loss
 ENABLE_DUAL_TIMEFRAME    = False
 ENABLE_LSMA_FILTER       = False
@@ -105,10 +105,10 @@ ENABLE_VOLATILITY_FILTER = False
 
 # ── V2.1 flags ──
 ENABLE_ATR_FILTER        = False
-ENABLE_CONSECUTIVE_LOSS  = False
+ENABLE_CONSECUTIVE_LOSS  = True
 ENABLE_DYNAMIC_SIZING    = False
 ENABLE_MARKET_REGIME     = False
-ENABLE_PROFIT_LOCKING    = False
+ENABLE_PROFIT_LOCKING    = True
 ENABLE_VOLUME_FILTER     = False
 ENABLE_TIME_FILTER       = False
 
@@ -128,7 +128,7 @@ VOLUME_EMA_PERIOD      = 20
 TIME_AVOID_HOURS       = [0, 1]
 TIME_AVOID_WEEKENDS    = False
 DUAL_TF_INTERVAL       = "15"
-LSMA_PERIOD            = 400
+LSMA_PERIOD            = 100
 LOG_FILE               = "/tmp/gkc_trades.csv"
 
 # ─── BOT MODE ─────────────────────────────────────────────────────────────────
